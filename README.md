@@ -6,6 +6,12 @@
 
 <p align="center">Chrome에서 틀어 둔 유튜브 노래의 곡 이름과 싱크 가사를 맥북 노치와 잠금 화면에 띄워 주는 macOS 앱입니다.</p>
 
+<p align="center">
+  <img src="demo.gif" width="640" alt="노치에 마우스를 올리면 곡과 가사가 펼쳐지고, 잠금 화면에는 시계 아래에 카드가 나타나는 모습">
+  <br>
+  <sub>데모용 곡과 가사로 만든 화면입니다.</sub>
+</p>
+
 ## 설치
 
 1. `YouTubeLyricNotch-<버전>.dmg`를 열고 `YouTube Lyric Notch`를 **Applications**로 끌어다 놓아 주세요.
