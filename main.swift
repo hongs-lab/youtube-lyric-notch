@@ -1,4 +1,4 @@
-// 유튜브 노치: Chrome에서 틀어 둔 유튜브의 지금 곡과 가사를 맥북 노치에 띄운다. 노치에 마우스를 올리면 펼쳐져 가사와 재생 버튼이 나온다.
+// YouTube Lyric Notch: Chrome에서 틀어 둔 유튜브의 지금 곡과 가사를 맥북 노치에 띄운다. 노치에 마우스를 올리면 펼쳐져 가사와 재생 버튼이 나온다.
 // 잠금 화면에서는 시계 아래에 곡·가사 카드를 띄운다(비공개 SkyLight API로 잠금 화면 위 층에 올림). '지금 재생 중'에도 곡·지금 가사 줄을 보낸다.
 // 플리 영상(한 영상에 여러 곡)은 설명란·댓글의 타임라인으로 지금 곡을 찾는다. 가사는 LRCLIB → 벅스 순으로 찾는다.
 // 준비(한 번만): Chrome 메뉴 보기 > 개발자 > 'Apple Events의 자바스크립트 허용'
@@ -176,7 +176,7 @@ func fetch(_ url: String, _ query: [String: String] = [:], body: Data? = nil) as
     let host = c.host ?? "", lrclib = host == "lrclib.net"
     var req = URLRequest(url: c.url!)
     // LRCLIB는 앱 이름을 밝혀 달라고 한다. 유튜브·벅스는 브라우저처럼.
-    req.setValue(lrclib ? "YouTubeNotch/1.1.0 (personal macOS app)" : "Mozilla/5.0 (youtube-notch, personal)", forHTTPHeaderField: "User-Agent")
+    req.setValue(lrclib ? "YouTubeLyricNotch/1.1.0 (personal macOS app)" : "Mozilla/5.0 (youtube-notch, personal)", forHTTPHeaderField: "User-Agent")
     req.timeoutInterval = 8  // 서버가 늘어지면 기본 60초를 기다리게 된다
     if let body { req.httpMethod = "POST"; req.httpBody = body; req.setValue("application/json", forHTTPHeaderField: "Content-Type") }
     for attempt in 0..<3 {
@@ -727,7 +727,7 @@ struct NotchView: View {
                         get: { SMAppService.mainApp.status == .enabled },
                         set: { on in try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }))
                     Divider()
-                    Button("유튜브 노치 종료") { NSApp.terminate(nil) }
+                    Button("YouTube Lyric Notch 종료") { NSApp.terminate(nil) }
                 }
         }
         .foregroundStyle(.white)

@@ -3,8 +3,8 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key><string>com.hongje.youtube-notch</string>
-    <key>CFBundleName</key><string>유튜브 노치</string>
-    <key>CFBundleDisplayName</key><string>유튜브 노치</string>
+    <key>CFBundleName</key><string>YouTube Lyric Notch</string>
+    <key>CFBundleDisplayName</key><string>YouTube Lyric Notch</string>
     <key>CFBundleExecutable</key><string>notch</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>

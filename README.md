@@ -8,8 +8,8 @@
 
 ## 설치
 
-1. `YouTubeNotch-<버전>.dmg`를 열고 `유튜브 노치`를 **Applications**로 끌어다 놓아 주세요.
-2. 응용 프로그램에서 **유튜브 노치**를 열어 주세요.
+1. `YouTubeLyricNotch-<버전>.dmg`를 열고 `YouTube Lyric Notch`를 **Applications**로 끌어다 놓아 주세요.
+2. 응용 프로그램에서 **YouTube Lyric Notch**를 열어 주세요.
    - "열 수 없음" 경고가 뜨면 앱을 우클릭한 뒤 **열기**를 눌러 주세요. 시스템 설정 > 개인정보 보호 및 보안 > **그래도 열기**로도 열 수 있어요.
 3. "Google Chrome을 제어하려고 합니다" 창이 뜨면 **허용**을 눌러 주세요.
 4. Chrome 메뉴에서 **보기 > 개발자 > Apple Events의 자바스크립트 허용**을 켜 주세요.
