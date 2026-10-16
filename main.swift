@@ -176,7 +176,7 @@ func fetch(_ url: String, _ query: [String: String] = [:], body: Data? = nil) as
     let host = c.host ?? "", lrclib = host == "lrclib.net"
     var req = URLRequest(url: c.url!)
     // LRCLIB는 앱 이름을 밝혀 달라고 한다. 유튜브·벅스는 브라우저처럼.
-    req.setValue(lrclib ? "YouTubeLyricNotch/1.1.0 (personal macOS app)" : "Mozilla/5.0 (youtube-notch, personal)", forHTTPHeaderField: "User-Agent")
+    req.setValue(lrclib ? "YouTubeLyricNotch/1.1.1 (personal macOS app)" : "Mozilla/5.0 (youtube-notch, personal)", forHTTPHeaderField: "User-Agent")
     req.timeoutInterval = 8  // 서버가 늘어지면 기본 60초를 기다리게 된다
     if let body { req.httpMethod = "POST"; req.httpBody = body; req.setValue("application/json", forHTTPHeaderField: "Content-Type") }
     for attempt in 0..<3 {
@@ -769,7 +769,7 @@ struct NotchView: View {
                 }
                 .lineLimit(1)
                 progress
-                LyricsView(m: m)
+                LyricsView(m: m, now: m.t)
                 controls(v)
             }
         }
@@ -834,7 +834,7 @@ struct LockCard: View {
                         Spacer(minLength: 0)
                     }
                     n.progress
-                    LyricsView(m: m)
+                    LyricsView(m: m, now: m.t)
                     n.controls(v)
                 }
                 .padding(18)
@@ -885,12 +885,13 @@ func isLocked() -> Bool { (CGSessionCopyCurrentDictionary() as? [String: Any])?[
 /// 탐색·건너뛰기로 크게 뛰면 수십 줄을 훑지 않고 그 자리로 바로 간다(LiveLyrics 방식).
 struct LyricsView: View {
     @ObservedObject var m: Model
+    let now: Double  // 영상 시간. 부모의 0.25초 타이머가 넘겨 줘야 가사가 제때 넘어간다(m만으로는 Chrome을 읽을 때만 다시 그려짐)
     @State private var shown = 0  // 직전에 보여 준 줄
 
     var body: some View {
         let s = m.song, l = m.lyrics[s.name] ?? Lyrics()
         let rows = ["♪"] + l.lines.map { $0.isEmpty ? "♪" : $0 }  // 맨 앞 ♪ = 첫 줄 전 전주
-        let i = lineIndex(l, at: m.t - s.start, length: s.length) + 1, rowH: CGFloat = 22
+        let i = lineIndex(l, at: now - s.start, length: s.length) + 1, rowH: CGFloat = 22
         VStack(spacing: 0) {
             ForEach(rows.indices, id: \.self) { j in
                 Text(rows[j])

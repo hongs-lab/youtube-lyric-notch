@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION=1.1.0
+VERSION=1.1.1
 NAME="YouTube Lyric Notch"
 # 조립·서명은 임시 폴더에서: Documents가 iCloud로 동기화되면 앱 폴더에 Finder 정보가 다시 붙어 서명 검증이 깨진다
 WORK=$(mktemp -d)
