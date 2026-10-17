@@ -770,7 +770,8 @@ let notch = CGSize(width: hasNotch ? screen.frame.width - (screen.auxiliaryTopLe
                    height: hasNotch ? screen.safeAreaInsets.top : NSStatusBar.system.thickness)
 let wing = notch.height + 10  // 노치 양옆으로 삐져나오는 폭(썸네일·막대 한 칸)
 let small = CGSize(width: notch.width + wing * 2, height: notch.height)
-let big = CGSize(width: max(small.width, 380), height: notch.height + 300)
+/// 펼친 노치. 가사 크기를 키우면 그만큼 넓고 길어진다.
+var big: CGSize { CGSize(width: max(small.width, (380 * max(1, lyricSize / 15)).rounded()), height: notch.height + 300 + 3 * (lyricSize - 15)) }
 let compact = CGSize(width: max(small.width, 330), height: notch.height + 50)  // 곡 없이 안내 한 줄
 
 func clock(_ s: Double) -> String { let s = max(0, Int(s)); return String(format: "%d:%02d", s / 60, s % 60) }
@@ -923,7 +924,7 @@ struct LockCard: View {
                         Spacer(minLength: 0)
                     }
                     n.progress
-                    LyricsView(m: m, now: m.t)
+                    LyricsView(m: m, now: m.t, scaled: false)
                     n.controls(v)
                 }
                 .padding(18)
@@ -975,18 +976,20 @@ func isLocked() -> Bool { (CGSessionCopyCurrentDictionary() as? [String: Any])?[
 struct LyricsView: View {
     @ObservedObject var m: Model
     let now: Double  // 영상 시간. 부모의 0.25초 타이머가 넘겨 줘야 가사가 제때 넘어간다(m만으로는 Chrome을 읽을 때만 다시 그려짐)
+    var scaled = true  // 가사 크기 설정을 따를지(잠금 화면 카드는 크기가 정해져 있어 그대로)
     @AppStorage("lyricDelay") var delay = 0.5  // 가사 타이밍(설정)
+    @AppStorage("lyricSize") var setSize = 15.0  // 가사 크기(설정)
     @State private var shown = 0  // 직전에 보여 준 줄
 
     var body: some View {
         let s = m.song, l = m.lyrics[m.key(s.name)] ?? Lyrics()
         let rows = ["♪"] + l.lines.map { $0.isEmpty ? "♪" : $0 }  // 맨 앞 ♪ = 첫 줄 전 전주
-        let i = lineIndex(l, at: now - s.start - delay, length: s.length) + 1, rowH: CGFloat = 22
+        let i = lineIndex(l, at: now - s.start - delay, length: s.length) + 1, size = scaled ? setSize : 15, rowH = size + 7
         ZStack {
             VStack(spacing: 0) {
                 ForEach(rows.indices, id: \.self) { j in
                     Text(rows[j])
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.system(size: size, weight: .semibold))
                         .lineLimit(1)
                         .scaleEffect(j == i ? 1 : 0.82)
                         .opacity(j == i ? 1 : abs(j - i) == 1 ? 0.4 : 0)
@@ -1018,10 +1021,14 @@ var floating: Bool { UserDefaults.standard.string(forKey: "mode") == "float" }
 /// (측정: 다음 곡 소리가 타임라인보다 0.55초 늦게 시작). 그래서 기본은 0.5초 늦게, 설정에서 귀에 맞게 조절.
 var lyricDelay: Double { UserDefaults.standard.object(forKey: "lyricDelay") as? Double ?? 0.5 }
 
+/// 가사 글자 크기(기본 15). 노치와 떠 있는 가사 창이 이에 맞춰 커진다.
+var lyricSize: Double { UserDefaults.standard.object(forKey: "lyricSize") as? Double ?? 15 }
+
 struct SettingsView: View {
     @AppStorage("mode") var mode = "notch"
     @AppStorage("floatOpacity") var opacity = 0.3
     @AppStorage("lyricDelay") var delay = 0.5
+    @AppStorage("lyricSize") var size = 15.0
     @AppStorage("showMenuIcon") var menuIcon = true
     @State private var login = SMAppService.mainApp.status == .enabled
 
@@ -1036,6 +1043,7 @@ struct SettingsView: View {
                 Slider(value: $opacity, in: 0...0.8) { Text("배경 진하기") }
                 Text("가사 창은 끌어서 원하는 곳으로 옮길 수 있어요. 0이면 배경 없이 글자만 보여요.").font(.caption).foregroundStyle(.secondary)
             }
+            Slider(value: $size, in: 12...24, step: 1) { Text("가사 크기 \(Int(size))") }
             Slider(value: $delay, in: -1...2, step: 0.1) { Text("가사 타이밍 \(String(format: "%+.1f", delay))초") }
             Text("가사가 노래보다 먼저 넘어가면 늘리고, 늦게 넘어가면 줄여 주세요.").font(.caption).foregroundStyle(.secondary)
             Toggle("메뉴 막대에 아이콘 보이기", isOn: $menuIcon)
@@ -1051,7 +1059,7 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         // 그룹 폼은 안에서 스크롤돼 스스로 높이를 정하지 않는다(창이 제목 줄만 남는다). 방식마다 높이를 정해 준다.
-        .frame(width: 400, height: (mode == "float" ? 390 : 310) + (menuIcon ? 45 : 90))
+        .frame(width: 400, height: (mode == "float" ? 430 : 350) + (menuIcon ? 45 : 90))
     }
 }
 
@@ -1089,7 +1097,8 @@ struct FloatingLyrics: View {
         }
     }
 }
-let floatSize = CGSize(width: 460, height: 86)
+/// 떠 있는 가사 창 크기: 가사 크기에 맞춰
+var floatSize: CGSize { CGSize(width: (460 * lyricSize / 15).rounded(), height: 3 * (lyricSize + 7) + 20) }
 
 /// 아무 데나 잡고 끌면 창이 옮겨지게
 final class DragHost<V: View>: NSHostingView<V> {
@@ -1224,6 +1233,10 @@ Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
     if statusItem.isVisible != icon { statusItem.isVisible = icon }
     let show = floating && model.video != nil  // 떠 있는 가사 창은 그 방식을 골랐고 곡이 있을 때만
     if show != floatPanel.isVisible { show ? floatPanel.orderFrontRegardless() : floatPanel.orderOut(nil) }
+    // 가사 크기를 바꾸면 창도 맞춰서(노치는 화면 위 가운데, 떠 있는 가사 창은 가운데·윗변을 그대로)
+    let b = big, f = floatPanel.frame, fs = floatSize
+    if panel.frame.size != b { panel.setFrame(NSRect(x: screen.frame.midX - b.width / 2, y: screen.frame.maxY - b.height, width: b.width, height: b.height), display: true) }
+    if f.size != fs { floatPanel.setFrame(NSRect(x: f.midX - fs.width / 2, y: f.maxY - fs.height, width: fs.width, height: fs.height), display: true) }
     let s = model.size
     let r = NSRect(x: screen.frame.midX - s.width / 2, y: screen.frame.maxY - s.height, width: s.width, height: s.height + 1)
     let hover = model.visible && r.contains(NSEvent.mouseLocation)
