@@ -116,7 +116,8 @@ func lineIndex(_ l: Lyrics, at t: Double, length: Double) -> Int {
 /// 검색어 후보(악센트는 풀어서: México → Mexico):
 /// 괄호 속(영문 제목, feat., MV …)을 뺀 것 → "가수 - 제목"이면 첫 가수 + 제목, 괄호 속 다른 이름 + 제목
 /// (여러 가수, 영문·한글 이름 중 하나만 맞아도 찾게) → 괄호만 푼 것 → (단일 곡 영상이면) 채널 이름을 붙인 것.
-func queries(_ name: String, author: String? = nil) -> [String] {
+/// hint(플리의 주인공 가수)가 있으면 "가수 + 곡 제목"을 맨 앞에: 곡 제목만 적은 플리에서 같은 제목의 다른 가수 곡을 피한다.
+func queries(_ name: String, author: String? = nil, hint: String? = nil) -> [String] {
     let name = name.applyingTransform(.stripDiacritics, reverse: false) ?? name
     func tidy(_ s: String) -> String {
         s.replacingOccurrences(of: #"(?i)\b(official|music video|lyrics?|audio|visualizer|m/?v)\b|가사|뮤직비디오|뮤비"#, with: " ", options: .regularExpression)
@@ -125,6 +126,7 @@ func queries(_ name: String, author: String? = nil) -> [String] {
     }
     func strip(_ s: String) -> String { s.replacingOccurrences(of: #"\([^)]*\)|\[[^\]]*\]|【[^】]*】"#, with: " ", options: .regularExpression) }
     var qs = [tidy(strip(name))]
+    if let hint { qs.insert(tidy(hint + " " + strip(name)), at: 0) }
     if let r = name.range(of: #"\s+[-–—]\s+|_"#, options: .regularExpression) {
         let artist = String(name[..<r.lowerBound]), title = tidy(strip(String(name[r.upperBound...])))
         qs.append(tidy(strip(artist).components(separatedBy: CharacterSet(charactersIn: ",&")).first ?? artist) + " " + title)
@@ -201,10 +203,37 @@ func parseBugs(_ s: String) -> Lyrics {
     return Lyrics(lines: pairs.map { $0.1 }, times: pairs.map { $0.0 })
 }
 
-/// 벅스 곡 검색 결과에서 제목이 우리 곡 이름과 맞는 첫 곡의 id(반주 버전은 가사가 없으니 건너뜀)
-func bugsTrack(_ html: String, for name: String) -> String? {
-    html.matches(of: #/value="(\d+)" name="check" disc_id="\d+" title="([^"]*)"/#)
-        .first { !$0.2.contains("Inst.") && sameSong(name, String($0.2)) }.map { String($0.1) }
+/// 검색 결과의 가수(여러 명·괄호 속 다른 이름 중 하나라도)가 곡 이름·영상 제목·채널 어딘가에 나오나
+func artistIn(_ artist: String, _ context: String) -> Bool {
+    let c = squash(context)
+    return artist.replacingOccurrences(of: #"(?i)\s+(feat\.?|ft\.?|with|x)\s+"#, with: ",", options: .regularExpression)
+        .replacingOccurrences(of: #"\(([^)]*)\)"#, with: ",$1,", options: .regularExpression)
+        .components(separatedBy: CharacterSet(charactersIn: ",&×/"))
+        .map(squash).contains { $0.count >= 2 && c.contains($0) }
+}
+
+/// 플리 영상 제목에 나온 낱말 중 타임라인 곡 이름들에 가장 자주(2곡 이상) 나오는 것 = 그 플리의 주인공 가수.
+/// "릴러말즈 노래모음"처럼 가수를 빼고 곡 제목만 적은 플리에서 검색어와 가수 확인에 쓴다.
+func playlistArtist(title: String, tracks: [Track]) -> String? {
+    let names = tracks.map { squash($0.name) }
+    let words = Set(title.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count >= 2 })
+    let best = words.map { w in (w, names.filter { $0.contains(squash(w)) }.count) }.max { $0.1 < $1.1 }
+    return best.flatMap { $0.1 >= 2 ? $0.0 : nil }
+}
+
+let bugsRow = try! NSRegularExpression(pattern: #"<tr[^>]*trackId="\d+".*?</tr>"#, options: .dotMatchesLineSeparators)
+
+/// 벅스 곡 검색 결과에서 제목과 가수가 둘 다 맞는 첫 곡의 id(반주 버전은 가사가 없으니 건너뜀).
+/// 벅스는 곡 길이를 주지 않아 가수로만 확인한다(같은 제목의 다른 가수 곡이 위에 오는 일이 많다).
+func bugsTrack(_ html: String, for name: String, context: String) -> String? {
+    let ns = html as NSString
+    for m in bugsRow.matches(in: html, range: NSRange(location: 0, length: ns.length)) {
+        let row = ns.substring(with: m.range)
+        guard let t = row.firstMatch(of: #/value="(\d+)" name="check" disc_id="\d+" title="([^"]*)"/#),
+              let a = row.firstMatch(of: #/<p class="artist">[^<]*<a[^>]*title="([^"]*)"/#) else { continue }
+        if !t.2.contains("Inst."), sameSong(name, String(t.2)), artistIn(String(a.1), context) { return String(t.1) }
+    }
+    return nil
 }
 
 func plainLines(_ s: String) -> Lyrics { Lyrics(lines: s.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) }
@@ -214,36 +243,40 @@ typealias Found = (synced: Lyrics?, plain: Lyrics?, failed: Bool)
 
 /// LRCLIB(영어권 강함)와 벅스(국내 곡 강함)에 함께 물어 싱크 가사 > 일반 가사. 제목이 안 맞는 결과는 버린다.
 /// nil: 어딘가에 닿지 못해(오프라인, 요청 제한) 못 찾았을 수 있음 → 나중에 다시
-func fetchLyrics(_ name: String, author: String?, length: Double) async -> Lyrics? {
-    let qs = queries(name, author: author)
-    async let bugs = bugsLyrics(name, Array(qs.prefix(3)))
-    let lrc = await lrclibLyrics(name, qs, length)
+/// context: 영상 제목·채널. 결과의 가수가 곡 이름·hint·context 어딘가에 있거나 곡 길이가 비슷해야 같은 곡으로 본다.
+func fetchLyrics(_ name: String, author: String?, hint: String? = nil, context: String = "", length: Double) async -> Lyrics? {
+    let qs = queries(name, author: author, hint: hint)
+    let ctx = [name, hint ?? "", context].joined(separator: " ")
+    async let bugs = bugsLyrics(name, ctx, Array(qs.prefix(3)))
+    let lrc = await lrclibLyrics(name, ctx, qs, length)
     if let s = lrc.synced { return s }  // 벅스 쪽은 취소된다
     let b = await bugs
     return b.synced ?? lrc.plain ?? b.plain ?? (lrc.failed || b.failed ? nil : .note("가사를 못 찾았어요"))
 }
 
-func lrclibLyrics(_ name: String, _ qs: [String], _ length: Double) async -> Found {
+func lrclibLyrics(_ name: String, _ ctx: String, _ qs: [String], _ length: Double) async -> Found {
     var plain: Lyrics?, failed = false
     for q in qs.prefix(3) {  // 요청 제한이 빡빡해서 세 번까지
         guard let d = await fetch("https://lrclib.net/api/search", ["q": q]) else { failed = true; continue }
         guard let hits = try? JSONDecoder().decode([Hit].self, from: d) else { continue }
-        // 제목이 맞는 것만. 싱크 가사, 가수까지 맞는 것, 곡 길이가 비슷한 것 우선
-        let cost = { (h: Hit) in
-            abs((h.duration ?? length) - length) + (h.syncedLyrics == nil ? 30 : 0) + (sameSong(name, h.artistName ?? "") ? 0 : 20)
-        }
-        let best = hits.filter { ($0.syncedLyrics != nil || $0.plainLyrics != nil) && sameSong(name, $0.trackName ?? "") }.min { cost($0) < cost($1) }
+        // 제목이 맞고, 가수가 맞거나(곡 이름·영상 제목·채널에 나옴) 곡 길이가 비슷한 것만. 같은 제목의 다른 가수 곡을 막는다.
+        // 그중 싱크 가사, 가수까지 맞는 것, 곡 길이가 비슷한 것 우선
+        let artistOK = { (h: Hit) in artistIn(h.artistName ?? "", ctx) }
+        let lengthOK = { (h: Hit) in h.duration.map { length > 0 && abs($0 - length) <= max(6, length * 0.05) } ?? false }
+        let cost = { (h: Hit) in abs((h.duration ?? length) - length) + (h.syncedLyrics == nil ? 30 : 0) + (artistOK(h) ? 0 : 20) }
+        let best = hits.filter { ($0.syncedLyrics != nil || $0.plainLyrics != nil) && sameSong(name, $0.trackName ?? "") && (artistOK($0) || lengthOK($0)) }
+            .min { cost($0) < cost($1) }
         if let s = best?.syncedLyrics, !s.isEmpty { return (parseLRC(s), nil, false) }
         if plain == nil, let p = best?.plainLyrics, !p.isEmpty { plain = plainLines(p) }
     }
     return (nil, plain, failed)
 }
 
-func bugsLyrics(_ name: String, _ qs: [String]) async -> Found {
+func bugsLyrics(_ name: String, _ ctx: String, _ qs: [String]) async -> Found {
     var id: String?, failed = false
     for q in qs where id == nil {  // 제목이 맞는 곡이 나올 때까지 검색어를 바꿔 가며
         guard let d = await fetch("https://music.bugs.co.kr/search/track", ["q": q]) else { failed = true; continue }
-        id = bugsTrack(String(decoding: d, as: UTF8.self), for: name)
+        id = bugsTrack(String(decoding: d, as: UTF8.self), for: name, context: ctx)
     }
     guard let id else { return (nil, nil, failed) }
     func text(_ d: Data?) -> String? { d.flatMap { try? JSONDecoder().decode(BugsLyrics.self, from: $0) }?.lyrics.flatMap { $0.isEmpty ? nil : $0 } }
@@ -284,10 +317,22 @@ if CommandLine.arguments.contains("--selftest") {
     precondition(jsonFields(#"x"author":"a","shortDescription":"0:00 \"곡\"\n1:00 b","author":"핑프""#, "author") == ["a", "핑프"])
     let b = parseBugs("11.0|난 아직＃23.5|i want to see you again＃끝")
     precondition(b.lines == ["난 아직", "i want to see you again"] && b.times == [11, 23.5])
-    let row = #"<tr trackId="6170006"><input type="checkbox" value="6170006" name="check" disc_id="1" title="See you again (Feat. A &amp; B)">"#
-    precondition(bugsTrack(row, for: "소수빈_See you again") == "6170006" && bugsTrack(row, for: "다른 곡") == nil)
-    let rows = #"value="1" name="check" disc_id="1" title="Rainbow days come after rain" value="2" name="check" disc_id="1" title="RAINBOW (Inst.)" value="3" name="check" disc_id="1" title="RAINBOW""#
-    precondition(bugsTrack(rows, for: "PL (피엘)_RAINBOW") == "3")
+    func row(_ id: Int, _ title: String, _ artist: String) -> String {
+        #"<tr trackId="\#(id)"><input type="checkbox" value="\#(id)" name="check" disc_id="1" title="\#(title)"><p class="artist"><a href="x" title="\#(artist)">\#(artist)</a></p></tr>"#
+    }
+    precondition(bugsTrack(row(6170006, "See you again (Feat. A &amp; B)", "소수빈"), for: "소수빈_See you again", context: "소수빈_See you again") == "6170006")
+    precondition(bugsTrack(row(1, "다른 곡", "소수빈"), for: "See you again", context: "") == nil)
+    let rows = row(1, "Rainbow days come after rain", "Drew") + row(2, "RAINBOW (Inst.)", "PL(피엘)") + row(3, "RAINBOW", "PL(피엘)")
+    precondition(bugsTrack(rows, for: "PL (피엘)_RAINBOW", context: "PL (피엘)_RAINBOW") == "3")
+    // 같은 제목, 다른 가수: 곡 제목만 적힌 플리에서 성시경의 "거리에서"를 고르지 않는다
+    let same = row(1, "거리에서", "성시경") + row(2, "거리에서", "김광석") + row(3, "거리에서 (Feat. ASH ISLAND)", "릴러말즈 (Leellamarz)")
+    precondition(bugsTrack(same, for: "거리에서 (Feat. ASH ISLAND)", context: "거리에서 (Feat. ASH ISLAND) 릴러말즈 [Playlist] 릴러말즈 노래모음 |Leellamarz|") == "3")
+    precondition(bugsTrack(row(1, "거리에서", "성시경"), for: "거리에서", context: "거리에서 [Playlist] 감성힙합 모음") == nil)
+    precondition(artistIn("Leellamarz, ASH ISLAND", "릴러말즈 (Leellamarz)_거리에서") && artistIn("IU (아이유)", "아이유 - 밤편지") && !artistIn("성시경", "릴러말즈 노래모음"))
+    let lr = timeline("0:00 거리에서 (Feat. ASH ISLAND)\n3:29 Trip (Feat. Hannah)\n7:23 하지마 - 릴러말즈, TOIL\n9:00 RUN - 릴러말즈, Panda Gomm")
+    precondition(playlistArtist(title: "[Playlist] 설렘 가득 감성힙합 릴러말즈 노래모음 |Leellamarz|", tracks: lr) == "릴러말즈")
+    precondition(playlistArtist(title: "[Playlist] 감성 플리", tracks: lr) == nil)
+    precondition(queries("거리에서 (Feat. ASH ISLAND)", hint: "릴러말즈").first == "릴러말즈 거리에서")
     precondition(sameSong("아이유 - 밤편지", "Through the Night (밤편지)") && sameSong("JAEHA (재하)_3　2　1", "3 2 1"))
     precondition(!sameSong("Crush - Whatever You Do (Feat. GRAY)", "Other (Feat. GRAY)") && !sameSong("dori_2 O' CLOCK", "Yours"))
     // 곡 알아내는 순서
@@ -473,7 +518,11 @@ final class Model: ObservableObject {
     @Published var video: Video?
     @Published var problem: String?
     @Published var expanded = false
-    @Published var lyrics: [String: Lyrics] = Store.load("lyrics.json") ?? [:]  // 곡 이름 → 가사
+    // "영상 id|곡 이름" → 가사. 곡 이름만으로는 다른 플리의 같은 제목 곡과 섞여서 영상별로 둔다
+    // (파일 이름을 바꿔, 예전에 같은 제목의 다른 가수 곡으로 잘못 저장된 가사는 버린다)
+    @Published var lyrics: [String: Lyrics] = Store.load("lyrics-v2.json") ?? [:]
+    var hint: String?  // 플리의 주인공 가수(곡 제목만 적은 플리에서 검색어·가수 확인에)
+    var context = ""   // 영상 제목·채널(검색 결과의 가수 확인에)
     var info: [String: Info] = Store.load("info.json") ?? [:]  // 영상 id → 설명란·댓글, 채널, 분류(저장해 둔 걸 먼저 쓰고 새로 받아 바꾼다)
     var dirty = false  // 디스크에 아직 안 쓴 게 있음
     var last: (json: String, tab: NSAppleEventDescriptor, at: Date)?  // 마지막으로 읽은 영상(설명란이 오자마자 다시 반영하려고)
@@ -564,12 +613,14 @@ final class Model: ObservableObject {
         // 결과가 도착한 때가 아니라 페이지가 읽은 순간 기준(그 사이 Chrome이나 앱이 바빴으면 그만큼 어긋나던 것)
         polledAt = v.at.map { Date(timeIntervalSince1970: $0 / 1000) } ?? at
         tracks = found
+        hint = playlistArtist(title: v.title, tracks: found)
+        context = v.title + " " + meta.author
         single = one
 
         let s = song
         // 곡을 못 알아낸 긴 영상(타임라인 없는 플리·라이브 …)은 제목으로 가사를 찾지 않는다
         if songs == .none {
-            if lyrics[s.name] == nil { lyrics[s.name] = .note("타임라인을 못 찾았어요") }
+            if lyrics[key(s.name)] == nil { lyrics[key(s.name)] = .note("타임라인을 못 찾았어요") }
             return
         }
         want(s.name, author: single?.author, length: s.length)
@@ -577,30 +628,35 @@ final class Model: ObservableObject {
         // 요청 제한을 피하려고 한 번에 한 곡, 1초씩 쉬어 가며.
         guard loading.isEmpty, Date().timeIntervalSince(lastFetch) > 1, !tracks.isEmpty else { return }
         let i = tracks.lastIndex { $0.start <= t } ?? 0
-        if let k = (Array(i + 1..<tracks.count) + Array(0..<i)).first(where: { lyrics[tracks[$0].name] == nil }) {
+        if let k = (Array(i + 1..<tracks.count) + Array(0..<i)).first(where: { lyrics[key(tracks[$0].name)] == nil }) {
             let end = k + 1 < tracks.count ? tracks[k + 1].start : v.duration
             want(tracks[k].name, author: nil, length: end - tracks[k].start)
         }
     }
 
     /// 그 곡 가사를 아직 안 찾았으면 찾기 시작
+    func key(_ name: String) -> String { "\(video?.id ?? "")|\(name)" }
+
     func want(_ name: String, author: String?, length: Double) {
-        guard lyrics[name] == nil else { return }
+        let k = key(name)
+        guard lyrics[k] == nil else { return }
         // "광고 스킵", "intro" 같은 타임라인 메모는 곡이 아니다
-        if name.range(of: #"(?i)^\s*(광고|ad\b|intro|인트로|outro|아웃트로)"#, options: .regularExpression) != nil { lyrics[name] = .note("♪"); return }
-        lyrics[name] = .note("가사 찾는 중…")
-        loading.insert(name)
+        if name.range(of: #"(?i)^\s*(광고|ad\b|intro|인트로|outro|아웃트로)"#, options: .regularExpression) != nil { lyrics[k] = .note("♪"); return }
+        lyrics[k] = .note("가사 찾는 중…")
+        loading.insert(k)
+        // 곡 이름에 이미 그 가수가 있으면 hint는 안 붙인다
+        let hint = self.hint.flatMap { squash(name).contains(squash($0)) ? nil : $0 }, context = self.context
         Task {
-            let l = await fetchLyrics(name, author: author, length: length)
+            let l = await fetchLyrics(name, author: author, hint: hint, context: context, length: length)
             await MainActor.run {
-                self.loading.remove(name)
+                self.loading.remove(k)
                 self.lastFetch = Date()
                 if l?.note == false { self.dirty = true }
                 // 서버에 못 닿았으면 30초 뒤 다시, 세 번까지(특정 검색어에만 계속 503을 주는 경우가 있다)
-                let n = l == nil ? self.tries[name, default: 0] + 1 : 0
-                self.tries[name] = n
-                self.lyrics[name] = l ?? .note(n < 3 ? "가사 서버에 연결 못 함, 30초 뒤 다시" : "가사를 못 찾았어요")
-                if l == nil && n < 3 { DispatchQueue.main.asyncAfter(deadline: .now() + 30) { self.lyrics[name] = nil } }
+                let n = l == nil ? self.tries[k, default: 0] + 1 : 0
+                self.tries[k] = n
+                self.lyrics[k] = l ?? .note(n < 3 ? "가사 서버에 연결 못 함, 30초 뒤 다시" : "가사를 못 찾았어요")
+                if l == nil && n < 3 { DispatchQueue.main.asyncAfter(deadline: .now() + 30) { self.lyrics[k] = nil } }
             }
         }
     }
@@ -609,7 +665,7 @@ final class Model: ObservableObject {
     func save() {
         guard dirty else { return }
         dirty = false
-        Store.save(lyrics.filter { !$0.value.note }, "lyrics.json")
+        Store.save(lyrics.filter { !$0.value.note }, "lyrics-v2.json")
         Store.save(info, "info.json")
     }
 
@@ -647,7 +703,7 @@ final class Model: ObservableObject {
     /// 지금 부르는 가사 한 줄. 가사가 없거나 안내 문구뿐이면 nil
     var line: String? {
         let s = song
-        guard let l = lyrics[s.name], !l.note else { return nil }
+        guard let l = lyrics[key(s.name)], !l.note else { return nil }
         let i = lineIndex(l, at: t - s.start - lyricDelay, length: s.length)
         return l.lines.indices.contains(i) && !l.lines[i].isEmpty ? l.lines[i] : "♪"
     }
@@ -896,7 +952,7 @@ struct LyricsView: View {
     @State private var shown = 0  // 직전에 보여 준 줄
 
     var body: some View {
-        let s = m.song, l = m.lyrics[s.name] ?? Lyrics()
+        let s = m.song, l = m.lyrics[m.key(s.name)] ?? Lyrics()
         let rows = ["♪"] + l.lines.map { $0.isEmpty ? "♪" : $0 }  // 맨 앞 ♪ = 첫 줄 전 전주
         let i = lineIndex(l, at: now - s.start - delay, length: s.length) + 1, rowH: CGFloat = 22
         VStack(spacing: 0) {
