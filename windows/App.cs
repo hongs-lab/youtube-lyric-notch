@@ -34,6 +34,7 @@ public class Prefs
     public string Mode { get; set; } = "island";   // "island" = 화면 위 아일랜드 / "float" = 떠 있는 가사 창
     public double Opacity { get; set; } = 0.3;      // 떠 있는 가사 창 배경 진하기
     public double Delay { get; set; } = 0.5;        // 가사 타이밍: 플리 타임라인이 실제 노래보다 조금 이른 경우가 많아(측정 0.55초) 기본 0.5초 늦게
+    public double Size { get; set; } = 15;          // 가사 글자 크기. 아일랜드와 떠 있는 가사 창이 이에 맞춰 커진다
     public double? FloatX { get; set; }
     public double? FloatY { get; set; }
     public static Prefs Now = Store.Load<Prefs>("settings.json") ?? new Prefs();
@@ -251,22 +252,22 @@ public class Meter
 /// 다음 곡으로 넘어가면 맨 위로 되감듯 이전 곡 가사는 아래로 빠지고 새 곡의 첫 줄이 위에서 내려온다.
 public class LyricsPanel : Canvas
 {
-    const double RowH = 24;
     StackPanel stack = new();
     TranslateTransform shift = new();
     string key = "", song = "";
     int shown = -1;
 
-    public LyricsPanel(double width) { Width = width; Height = RowH * 3; ClipToBounds = true; }
+    public LyricsPanel() { ClipToBounds = true; }  // 너비는 쓰는 쪽이 정한다(가사 크기에 따라)
 
     static DoubleAnimation Ease(double to) => new(to, TimeSpan.FromSeconds(0.45)) { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } };
 
     public void Update(Lyrics? l, string song, double t, double length)
     {
         l ??= new Lyrics();
-        var k = $"{song}#{l.Lines.Count}#{l.Note}";
+        double size = Prefs.Now.Size, rowH = size + 9;  // 가사 크기(설정)
+        var k = $"{song}#{l.Lines.Count}#{l.Note}#{size}#{Width}";
         var next = false;
-        if (k != key)  // 곡이 바뀌거나 가사가 막 도착: 줄을 새로 깔고 그 자리에서 시작
+        if (k != key)  // 곡이 바뀌거나 가사가 막 도착(또는 가사 크기를 바꿈): 줄을 새로 깔고 그 자리에서 시작
         {
             key = k; shown = -1;
             next = this.song.Length > 0 && song != this.song;  // 가사만 막 도착했을 땐 움직이지 않는다
@@ -280,18 +281,19 @@ public class LyricsPanel : Canvas
                 old.BeginAnimation(OpacityProperty, fade);
             }
             else Children.Remove(old);
+            Height = rowH * 3;
             stack = new StackPanel { Width = Width, RenderTransform = shift = new TranslateTransform() };
             Children.Add(stack);
             foreach (var line in new[] { "♪" }.Concat(l.Lines.Select(x => x.Length == 0 ? "♪" : x)))
                 stack.Children.Add(new TextBlock
                 {
-                    Text = line, Height = RowH, FontSize = 15, Foreground = Brushes.White, TextAlignment = TextAlignment.Center,
+                    Text = line, Height = rowH, FontSize = size, Foreground = Brushes.White, TextAlignment = TextAlignment.Center,
                     TextTrimming = TextTrimming.CharacterEllipsis, VerticalAlignment = VerticalAlignment.Center,
                 });
         }
         var i = Core.LineIndex(l, t, length) + 1;
         if (i == shown) return;
-        var y = (1 - i) * RowH;  // i번째 줄이 가운데 칸에
+        var y = (1 - i) * rowH;  // i번째 줄이 가운데 칸에
         if (next)
         {
             shift.Y = y - Height;
@@ -352,7 +354,9 @@ static class Win
 /// 화면 위 가운데 아일랜드: 접히면 썸네일·곡 이름·막대, 마우스를 잠깐 올려 두면 곡·진행 바·가사·재생 버튼
 public class Island
 {
-    static readonly Size Small = new(320, 38), Big = new(380, 330);
+    static readonly Size Small = new(320, 38);
+    /// 펼친 모습. 가사 크기를 키우면 그만큼 넓고 길어진다.
+    static Size Big => new(Math.Round(380 * Math.Max(1, Prefs.Now.Size / 15)), 330 + 3 * (Prefs.Now.Size - 15));
     public readonly Window Window = Win.Overlay(Big.Width + 20, Big.Height + 20);
     readonly Model m;
     readonly Border pill = new() { Background = Brushes.Black, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Top, ClipToBounds = true };
@@ -365,7 +369,7 @@ public class Island
     readonly Border track = new() { Height = 3, CornerRadius = new CornerRadius(1.5), Background = new SolidColorBrush(Color.FromArgb(50, 255, 255, 255)), Margin = new Thickness(8, 0, 8, 0) };
     readonly Border fill = new() { Height = 3, CornerRadius = new CornerRadius(1.5), Background = Brushes.White, HorizontalAlignment = HorizontalAlignment.Left };
     readonly TextBlock play = Win.Icon("", 20);
-    readonly LyricsPanel lyrics = new(336);
+    readonly LyricsPanel lyrics = new();
     readonly Rectangle[] bars = Enumerable.Range(0, 4).Select(_ => new Rectangle { Width = 3, Height = 3, RadiusX = 1.5, RadiusY = 1.5, Fill = Brushes.White, Margin = new Thickness(1, 0, 1, 0), VerticalAlignment = VerticalAlignment.Center }).ToArray();
     bool expanded;
     DateTime? hoverSince;
@@ -434,6 +438,15 @@ public class Island
     public void Tick(bool show, double level, double t)
     {
         pill.Opacity = show ? 1 : 0;
+        var b = Big;
+        if (Window.Width != b.Width + 20 || Window.Height != b.Height + 20)  // 가사 크기를 바꿈
+        {
+            var area = SystemParameters.WorkArea;
+            Window.Width = b.Width + 20; Window.Height = b.Height + 20;
+            Window.Left = area.Left + (area.Width - Window.Width) / 2;
+            if (expanded) Resize(b, 22);
+        }
+        lyrics.Width = b.Width - 44;
         // 마우스 위치(물리 픽셀 → WPF 단위)
         var dpi = VisualTreeHelper.GetDpi(Window);
         var p = Forms.Control.MousePosition;
@@ -478,7 +491,7 @@ public class Floating
 {
     public readonly Window Window = Win.Overlay(460, 92);
     readonly Border bg = new() { CornerRadius = new CornerRadius(18), Padding = new Thickness(18, 10, 18, 10) };
-    readonly LyricsPanel lyrics = new(424);
+    readonly LyricsPanel lyrics = new();
     readonly Model m;
 
     public Floating(Model model)
@@ -500,6 +513,9 @@ public class Floating
         if (show != Window.IsVisible) { if (show) Window.Show(); else Window.Hide(); }
         if (!show) return;
         bg.Background = new SolidColorBrush(Color.FromArgb((byte)(Prefs.Now.Opacity * 255), 0, 0, 0));
+        double w = Math.Round(460 * Prefs.Now.Size / 15), h = 3 * (Prefs.Now.Size + 9) + 20;
+        if (Window.Width != w || Window.Height != h) { Window.Left += (Window.Width - w) / 2; Window.Width = w; Window.Height = h; }  // 가사 크기를 바꾸면 가운데·윗변은 그대로
+        lyrics.Width = w - 36;
         var s = m.Song;
         lyrics.Update(m.LyricsByName.GetValueOrDefault(m.Key(s.Name)), s.Name, t - s.Start - Prefs.Now.Delay, s.Length);
     }
@@ -546,6 +562,12 @@ public class SettingsWindow : Window
         panel.Children.Add(floatBox);
         island.Checked += (_, _) => { p.Mode = "island"; Prefs.Save(); floatBox.Visibility = Visibility.Collapsed; };
         floating.Checked += (_, _) => { p.Mode = "float"; Prefs.Save(); floatBox.Visibility = Visibility.Visible; };
+
+        var sizeLabel = Label($"가사 크기 {p.Size}");
+        panel.Children.Add(sizeLabel);
+        var size = new Slider { Minimum = 12, Maximum = 24, Value = p.Size, TickFrequency = 1, IsSnapToTickEnabled = true };
+        size.ValueChanged += (_, e) => { p.Size = Math.Round(e.NewValue); Prefs.Save(); sizeLabel.Text = $"가사 크기 {p.Size}"; };
+        panel.Children.Add(size);
 
         var delayLabel = Label($"가사 타이밍 {p.Delay:+0.0;-0.0;0.0}초");
         panel.Children.Add(delayLabel);
