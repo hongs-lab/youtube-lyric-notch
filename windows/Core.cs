@@ -195,18 +195,32 @@ public static class Core
         return best.n >= 2 ? best.w : null;
     }
 
-    /// 벅스 곡 검색 결과에서 제목과 가수가 둘 다 맞는 첫 곡의 id(반주 버전은 건너뜀).
-    /// 벅스는 곡 길이를 주지 않아 가수로만 확인한다(같은 제목의 다른 가수 곡이 위에 오는 일이 많다).
-    public static string? BugsTrack(string html, string name, string context)
+    /// 벅스 곡 검색 결과에서 제목이 맞는 곡들(반주 버전은 빼고): id와 가수.
+    /// 가수 칸 앞에 HTML 주석이 끼는 줄(여러 가수)이 있어 주석을 건너뛰고 첫 가수를 읽는다.
+    public static List<(string id, string artist)> BugsCandidates(string html, string name)
     {
+        var list = new List<(string, string)>();
         foreach (Match row in Regex.Matches(html, @"<tr[^>]*trackId=""\d+"".*?</tr>", RegexOptions.Singleline))
         {
             var t = Regex.Match(row.Value, @"value=""(\d+)"" name=""check"" disc_id=""\d+"" title=""([^""]*)""");
-            var a = Regex.Match(row.Value, @"<p class=""artist"">[^<]*<a[^>]*title=""([^""]*)""");
-            if (t.Success && a.Success && !t.Groups[2].Value.Contains("Inst.") && SameSong(name, t.Groups[2].Value) && ArtistIn(a.Groups[1].Value, context))
-                return t.Groups[1].Value;
+            var a = Regex.Match(row.Value, @"<p class=""artist"">.*?<a [^>]*title=""([^""]*)""", RegexOptions.Singleline);
+            if (t.Success && a.Success && !t.Groups[2].Value.Contains("Inst.") && SameSong(name, t.Groups[2].Value))
+                list.Add((t.Groups[1].Value, a.Groups[1].Value));
         }
-        return null;
+        return list;
+    }
+
+    /// 제목과 가수가 둘 다 맞는 첫 곡(같은 제목의 다른 가수 곡이 위에 오는 일이 많다)
+    public static string? BugsTrack(string html, string name, string context) =>
+        BugsCandidates(html, name).Where(c => ArtistIn(c.artist, context)).Select(c => c.id).FirstOrDefault();
+
+    /// 벅스 곡 페이지의 재생 시간(초). 검색 결과에는 곡 길이가 없다.
+    static async Task<double?> BugsLength(string id)
+    {
+        var d = await Fetch($"https://music.bugs.co.kr/track/{id}");
+        if (d == null) return null;
+        var m = Regex.Match(Regex.Replace(d, "<[^>]+>", " "), @"재생 ?시간[^0-9]{0,200}(\d{1,2}):(\d{2})");
+        return m.Success ? double.Parse(m.Groups[1].Value) * 60 + double.Parse(m.Groups[2].Value) : null;
     }
 
     // MARK: 네트워크
@@ -281,7 +295,7 @@ public static class Core
     {
         var qs = Queries(name, author, hint);
         var ctx = string.Join(" ", name, hint ?? "", context);
-        var bugs = BugsLyrics(name, ctx, qs.Take(3).ToList());
+        var bugs = BugsLyrics(name, ctx, qs.Take(3).ToList(), length);
         var lrc = await LrclibLyrics(name, ctx, qs, length);
         if (lrc.Synced != null) return lrc.Synced;
         var b = await bugs;
@@ -312,15 +326,20 @@ public static class Core
         return new Found(null, plain, failed);
     }
 
-    static async Task<Found> BugsLyrics(string name, string ctx, List<string> qs)
+    static async Task<Found> BugsLyrics(string name, string ctx, List<string> qs, double length)
     {
         string? id = null;
         var failed = false;
-        foreach (var q in qs)  // 제목이 맞는 곡이 나올 때까지 검색어를 바꿔 가며
+        foreach (var q in qs)  // 맞는 곡이 나올 때까지 검색어를 바꿔 가며
         {
             var d = await Fetch("https://music.bugs.co.kr/search/track", new() { ["q"] = q });
             if (d == null) { failed = true; continue; }
-            id = BugsTrack(d, name, ctx);
+            var found = BugsCandidates(d, name);
+            id = found.Where(c => ArtistIn(c.artist, ctx)).Select(c => c.id).FirstOrDefault();
+            // 가수 표기가 달라(빅나티 ↔ BIG Naughty (서동현)) 안 맞으면 곡 길이로: 재생 시간이 타임라인 구간과 비슷한지(후보 3개까지)
+            if (id == null && length > 0)
+                foreach (var c in found.Take(3))
+                    if (await BugsLength(c.id) is { } l && Math.Abs(l - length) <= Math.Max(6, length * 0.05)) { id = c.id; break; }
             if (id != null) break;
         }
         if (id == null) return new Found(null, null, failed);
@@ -479,6 +498,9 @@ public static class Selftest
         var same = Row(1, "거리에서", "성시경") + Row(2, "거리에서", "김광석") + Row(3, "거리에서 (Feat. ASH ISLAND)", "릴러말즈 (Leellamarz)");
         Check(Core.BugsTrack(same, "거리에서 (Feat. ASH ISLAND)", "거리에서 (Feat. ASH ISLAND) 릴러말즈 [Playlist] 릴러말즈 노래모음 |Leellamarz|") == "3", "bugsTrack 가수");
         Check(Core.BugsTrack(Row(1, "거리에서", "성시경"), "거리에서", "거리에서 [Playlist] 감성힙합 모음") == null, "bugsTrack 다른 가수");
+        // 여러 가수인 줄은 가수 칸 앞에 HTML 주석이 낀다
+        var multi = @"<tr trackId=""7""><input type=""checkbox"" value=""7"" name=""check"" disc_id=""1"" title=""하지마""><p class=""artist""> <!-- a tag title --> <a href=""x"" class=""artistTitle"" title=""릴러말즈 (Leellamarz)"">릴러말즈</a> <a href=""javascript:void(0);"" class=""more"" title=""아티스트 전체보기"">x</a></p></tr>";
+        Check(Core.BugsTrack(multi, "하지마 - 릴러말즈, TOIL", "하지마 - 릴러말즈, TOIL") == "7", "bugsTrack 여러 가수");
         Check(Core.ArtistIn("Leellamarz, ASH ISLAND", "릴러말즈 (Leellamarz)_거리에서") && Core.ArtistIn("IU (아이유)", "아이유 - 밤편지") && !Core.ArtistIn("성시경", "릴러말즈 노래모음"), "artistIn");
         var lr = Core.Timeline("0:00 거리에서 (Feat. ASH ISLAND)\n3:29 Trip (Feat. Hannah)\n7:23 하지마 - 릴러말즈, TOIL\n9:00 RUN - 릴러말즈, Panda Gomm");
         Check(Core.PlaylistArtist("[Playlist] 설렘 가득 감성힙합 릴러말즈 노래모음 |Leellamarz|", lr) == "릴러말즈" && Core.PlaylistArtist("[Playlist] 감성 플리", lr) == null, "playlistArtist");
