@@ -4,7 +4,7 @@
 
 <h1 align="center">YouTube Lyric Notch</h1>
 
-<p align="center">Chrome에서 틀어 둔 유튜브 노래의 곡 이름과 싱크 가사를 맥북 노치와 잠금 화면에 띄워 주는 macOS 앱입니다.</p>
+<p align="center">브라우저에서 틀어 둔 유튜브 노래의 곡 이름과 싱크 가사를 맥북 노치와 잠금 화면에 띄워 주는 macOS 앱입니다. Windows 판도 있어요.</p>
 
 <p align="center">
   <img src="demo.gif" width="640" alt="노치에 마우스를 올리면 곡과 가사가 펼쳐지고, 잠금 화면에는 시계 아래에 카드가 나타나는 모습">
@@ -45,6 +45,18 @@ macOS 14 이상과 Google Chrome이 필요해요.
 
 플레이리스트 영상은 제목 → 설명란 → 댓글의 타임라인 순서로 지금 나오는 곡을 찾아요. 타임라인이 고정 댓글에만 있어도 괜찮아요.
 
+## Windows
+
+Windows에는 노치가 없어서, 화면 위 가운데의 작은 **아일랜드**가 그 자리를 대신해요.
+
+1. [Releases](https://github.com/hongs-lab/youtube-lyric-notch/releases)에서 `YouTubeLyricNotch-<버전>-windows-x64.zip`을 받아 압축을 풀고 `YouTubeLyricNotch.exe`를 실행해 주세요.
+   - "Windows의 PC 보호" 창이 뜨면 **추가 정보 > 실행**을 눌러 주세요. 코드 서명 인증서가 없는 앱이라 그래요.
+2. Chrome·Edge·Firefox·웨일에서 유튜브 음악을 틀면 화면 위 가운데에 아일랜드가 나타나요. 마우스를 잠깐 올려 두면 곡, 가사, 재생 버튼이 펼쳐져요. 접혀 있을 때는 클릭이 아래 창으로 그대로 통과해요.
+3. 작업 표시줄의 트레이 아이콘에서 설정과 종료를 할 수 있어요. 앱을 한 번 더 실행해도 설정 창이 열려요.
+   - 설정: 가사 보기 방식(아일랜드 / 떠 있는 가사 창), 배경 진하기, 가사 타이밍, Windows를 시작할 때 자동으로 열기
+
+Windows 10(2004) 이상 64비트가 필요해요. 브라우저 설정은 따로 필요 없어요(Windows 미디어 세션에서 곡과 재생 위치를 읽어요). 잠금 화면 카드는 Windows에서 지원하지 않아요.
+
 ## 직접 빌드
 
 ```bash
@@ -55,4 +67,10 @@ macOS 14 이상과 Google Chrome이 필요해요.
 
 ```bash
 swiftc -O main.swift -o notch && ./notch
+```
+
+Windows 판은 .NET 8 SDK로 빌드해요(macOS에서도 돼요). `windows/` 폴더에서:
+
+```bash
+dotnet publish -c Release -o publish
 ```
