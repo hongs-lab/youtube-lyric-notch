@@ -317,7 +317,7 @@ let js = """
   const v = document.querySelector('#movie_player video'), id = new URLSearchParams(location.search).get('v');
   if (!v || !id) return '';
   return JSON.stringify({ id, title: document.title.replace(/^[(][0-9]+[)] /, '').replace(/ - YouTube$/, ''),
-    time: v.currentTime, duration: v.duration || 0, playing: !v.paused,
+    time: v.currentTime, at: Date.now(), duration: v.duration || 0, playing: !v.paused,
     ad: document.getElementById('movie_player').classList.contains('ad-showing') });
 } catch (e) { return ''; } })()
 """
@@ -431,16 +431,19 @@ enum Chrome {
 
     /// 유튜브 영상 탭을 읽는다. 재생 중인 탭 우선. 꺼져 있으면 깨우지 않는다.
     /// 자바스크립트 허용은 Chrome 프로필마다 따로라, 읽히는 탭이 하나도 없을 때만 오류로 알린다.
-    static func read() -> Result<(json: String, tab: NSAppleEventDescriptor)?, NSError> {
+    /// at: 재생 시간을 읽은 순간(앱 쪽에 늦게 도착해도 시계가 밀리지 않게 이걸 기준으로 맞춘다)
+    static func read() -> Result<(json: String, tab: NSAppleEventDescriptor, at: Date)?, NSError> {
         guard !NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.Chrome").isEmpty else { return .success(nil) }
-        var found: (json: String, tab: NSAppleEventDescriptor)?, failed: NSError?
+        var found: (json: String, tab: NSAppleEventDescriptor, at: Date)?, failed: NSError?
         do {
             for (tab, url) in try tabs() where url.contains("youtube.com/watch") {
                 do {
+                    let start = Date()
                     let r = try run(js, in: tab)
+                    let at = start.addingTimeInterval(Date().timeIntervalSince(start) / 2)  // 요청과 응답의 중간쯤에 읽혔다
                     if r.isEmpty { continue }
-                    if r.contains("\"playing\":true") { return .success((r, tab)) }
-                    if found == nil { found = (r, tab) }
+                    if r.contains("\"playing\":true") { return .success((r, tab, at)) }
+                    if found == nil { found = (r, tab, at) }
                 } catch { failed = error as NSError }
             }
         } catch { return .failure(error as NSError) }
@@ -462,7 +465,8 @@ enum Store {
     }
 }
 
-struct Video: Decodable { var id, title: String; var time, duration: Double; var playing, ad: Bool }
+/// at: 페이지가 재생 시간을 읽은 순간(1970년부터 ms). 브라우저와 같은 시스템 시계라 응답이 늦게 와도 정확하다.
+struct Video: Decodable { var id, title: String; var time: Double; var at: Double? = nil; var duration: Double; var playing, ad: Bool }
 
 final class Model: ObservableObject {
     @Published var video: Video?
@@ -471,7 +475,7 @@ final class Model: ObservableObject {
     @Published var lyrics: [String: Lyrics] = Store.load("lyrics.json") ?? [:]  // 곡 이름 → 가사
     var info: [String: Info] = Store.load("info.json") ?? [:]  // 영상 id → 설명란·댓글, 채널, 분류(저장해 둔 걸 먼저 쓰고 새로 받아 바꾼다)
     var dirty = false  // 디스크에 아직 안 쓴 게 있음
-    var last: (json: String, tab: NSAppleEventDescriptor)?  // 마지막으로 읽은 영상(설명란이 오자마자 다시 반영하려고)
+    var last: (json: String, tab: NSAppleEventDescriptor, at: Date)?  // 마지막으로 읽은 영상(설명란이 오자마자 다시 반영하려고)
     var lastFetch = Date.distantPast  // 미리 찾기 간격
     var asked = Set<String>()
     var tries: [String: Int] = [:]  // 곡 이름 → 가사 찾기 실패 횟수
@@ -512,7 +516,7 @@ final class Model: ObservableObject {
             DispatchQueue.main.async {
                 self.busy.poll = false
                 switch r {
-                case .success(let found?): self.problem = nil; self.last = found; self.apply(found.json, tab: found.tab)
+                case .success(let found?): self.problem = nil; self.last = found; self.apply(found.json, tab: found.tab, at: found.at)
                 case .success(nil): self.problem = nil; self.video = nil
                 case .failure(let e) where e.code == -1743:
                     self.problem = "시스템 설정 > 개인정보 보호 및 보안 > 자동화에서\nChrome 제어를 허용해 주세요"; self.video = nil
@@ -525,7 +529,7 @@ final class Model: ObservableObject {
     }
 
     /// Chrome에서 읽은 영상 JSON과 그 탭을 반영한다
-    func apply(_ json: String, tab: NSAppleEventDescriptor) {
+    func apply(_ json: String, tab: NSAppleEventDescriptor, at: Date = Date()) {
         guard var v = try? JSONDecoder().decode(Video.self, from: Data(json.utf8)) else { video = nil; return }
         // 광고 동안은 곡 시간을 멈춰 둔다. 켜자마자 광고면 광고 시간을 곡 시간으로 착각하지 않게 아직 띄우지 않는다.
         if v.ad {
@@ -539,7 +543,7 @@ final class Model: ObservableObject {
                 let i = await fetchInfo(id)
                 await MainActor.run {
                     if let i { self.info[id] = i; self.dirty = true } else { DispatchQueue.main.asyncAfter(deadline: .now() + 30) { self.asked.remove(id) } }
-                    if let l = self.last { self.apply(l.json, tab: l.tab) }  // 다음 읽기를 기다리지 않고 바로
+                    if let l = self.last { self.apply(l.json, tab: l.tab, at: l.at) }  // 다음 읽기를 기다리지 않고 바로
                 }
                 if let d = await art, let img = NSImage(data: d) {
                     await MainActor.run { self.thumbs[id] = img; self.artwork[id] = MPMediaItemArtwork(boundsSize: img.size) { _ in img } }
@@ -556,7 +560,8 @@ final class Model: ObservableObject {
         else { video = nil; self.tab = nil; return }
         self.tab = tab
         video = v
-        polledAt = Date()
+        // 결과가 도착한 때가 아니라 페이지가 읽은 순간 기준(그 사이 Chrome이나 앱이 바빴으면 그만큼 어긋나던 것)
+        polledAt = v.at.map { Date(timeIntervalSince1970: $0 / 1000) } ?? at
         tracks = found
         single = one
 
