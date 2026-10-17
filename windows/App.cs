@@ -34,6 +34,7 @@ public class Prefs
     public string Mode { get; set; } = "island";   // "island" = 화면 위 아일랜드 / "float" = 떠 있는 가사 창
     public double Opacity { get; set; } = 0.3;      // 떠 있는 가사 창 배경 진하기
     public double Delay { get; set; } = 0.5;        // 가사 타이밍: 플리 타임라인이 실제 노래보다 조금 이른 경우가 많아(측정 0.55초) 기본 0.5초 늦게
+    public double Size { get; set; } = 15;          // 가사 글자 크기. 아일랜드와 떠 있는 가사 창이 이에 맞춰 커진다
     public double? FloatX { get; set; }
     public double? FloatY { get; set; }
     public static Prefs Now = Store.Load<Prefs>("settings.json") ?? new Prefs();
@@ -51,7 +52,12 @@ public class Model
     public List<Track> Tracks = new();
     public (string Name, string? Author)? Single;
     public GlobalSystemMediaTransportControlsSession? Session;
-    public Dictionary<string, Lyrics> LyricsByName = Store.Load<Dictionary<string, Lyrics>>("lyrics.json") ?? new();
+    // "영상 id|곡 이름" → 가사. 곡 이름만으로는 다른 플리의 같은 제목 곡과 섞여서 영상별로 둔다
+    // (파일 이름을 바꿔, 예전에 같은 제목의 다른 가수 곡으로 잘못 저장된 가사는 버린다)
+    public Dictionary<string, Lyrics> LyricsByName = Store.Load<Dictionary<string, Lyrics>>("lyrics-v2.json") ?? new();
+    string? hint;        // 플리의 주인공 가수(곡 제목만 적은 플리에서 검색어·가수 확인에)
+    string context = ""; // 영상 제목·채널(검색 결과의 가수 확인에)
+    public string Key(string name) => $"{Id}|{name}";
     public Dictionary<string, Info> InfoById = Store.Load<Dictionary<string, Info>>("info.json") ?? new();
     public Dictionary<string, string> IdByTitle = Store.Load<Dictionary<string, string>>("ids.json") ?? new();
     readonly HashSet<string> asked = new(), loading = new();
@@ -141,15 +147,17 @@ public class Model
         Id = id;
         Tracks = songs.List ?? new();
         Single = songs.One != null ? (songs.One, songs.Author) : null;
+        hint = Core.PlaylistArtist(Title, Tracks);
+        context = Title + " " + meta.Author;
         var s = Song;
-        if (songs.None) { if (!LyricsByName.ContainsKey(s.Name)) LyricsByName[s.Name] = Lyrics.MakeNote("타임라인을 못 찾았어요"); return; }
+        if (songs.None) { if (!LyricsByName.ContainsKey(Key(s.Name))) LyricsByName[Key(s.Name)] = Lyrics.MakeNote("타임라인을 못 찾았어요"); return; }
         Want(s.Name, Single?.Author, s.Length);
         // 플리의 나머지 곡 가사도 지금 곡 다음부터 차례로 미리 찾아 둔다(요청 제한을 피하려고 한 번에 한 곡, 1초씩 쉬어 가며)
         if (loading.Count > 0 || (DateTime.Now - lastFetch).TotalSeconds < 1 || Tracks.Count == 0) return;
         var i = Math.Max(0, Tracks.FindLastIndex(x => x.Start <= T));
         foreach (var k in Enumerable.Range(i + 1, Tracks.Count - i - 1).Concat(Enumerable.Range(0, i)))
         {
-            if (LyricsByName.ContainsKey(Tracks[k].Name)) continue;
+            if (LyricsByName.ContainsKey(Key(Tracks[k].Name))) continue;
             var end = k + 1 < Tracks.Count ? Tracks[k + 1].Start : Duration;
             Want(Tracks[k].Name, null, end - Tracks[k].Start);
             break;
@@ -160,22 +168,26 @@ public class Model
 
     void Want(string name, string? author, double length)
     {
-        if (LyricsByName.ContainsKey(name)) return;
+        var k = Key(name);
+        if (LyricsByName.ContainsKey(k)) return;
         // "광고 스킵", "intro" 같은 타임라인 메모는 곡이 아니다
-        if (System.Text.RegularExpressions.Regex.IsMatch(name, @"(?i)^\s*(광고|ad\b|intro|인트로|outro|아웃트로)")) { LyricsByName[name] = Lyrics.MakeNote("♪"); return; }
-        LyricsByName[name] = Lyrics.MakeNote("가사 찾는 중…");
-        loading.Add(name);
-        _ = Task.Run(() => Core.FetchLyrics(name, author, length)).ContinueWith(task =>
+        if (System.Text.RegularExpressions.Regex.IsMatch(name, @"(?i)^\s*(광고|ad\b|intro|인트로|outro|아웃트로)")) { LyricsByName[k] = Lyrics.MakeNote("♪"); return; }
+        LyricsByName[k] = Lyrics.MakeNote("가사 찾는 중…");
+        loading.Add(k);
+        // 곡 이름에 이미 그 가수가 있으면 hint는 안 붙인다
+        var h = hint != null && !Core.Squash(name).Contains(Core.Squash(hint)) ? hint : null;
+        var ctx = context;
+        _ = Task.Run(() => Core.FetchLyrics(name, author, length, h, ctx)).ContinueWith(task =>
         {
             var l = task.Result;
-            loading.Remove(name);
+            loading.Remove(k);
             lastFetch = DateTime.Now;
             // 서버에 못 닿았으면 30초 뒤 다시, 세 번까지
-            var n = l == null ? tries.GetValueOrDefault(name) + 1 : 0;
-            tries[name] = n;
-            LyricsByName[name] = l ?? Lyrics.MakeNote(n < 3 ? "가사 서버에 연결 못 함, 30초 뒤 다시" : "가사를 못 찾았어요");
+            var n = l == null ? tries.GetValueOrDefault(k) + 1 : 0;
+            tries[k] = n;
+            LyricsByName[k] = l ?? Lyrics.MakeNote(n < 3 ? "가사 서버에 연결 못 함, 30초 뒤 다시" : "가사를 못 찾았어요");
             if (l is { Note: false }) dirty = true;
-            if (l == null && n < 3) _ = Task.Delay(30_000).ContinueWith(_ => LyricsByName.Remove(name), TaskScheduler.FromCurrentSynchronizationContext());
+            if (l == null && n < 3) _ = Task.Delay(30_000).ContinueWith(_ => LyricsByName.Remove(k), TaskScheduler.FromCurrentSynchronizationContext());
         }, TaskScheduler.FromCurrentSynchronizationContext());
     }
 
@@ -183,7 +195,7 @@ public class Model
     {
         if (!dirty) return;
         dirty = false;
-        Store.Save(LyricsByName.Where(kv => !kv.Value.Note).ToDictionary(kv => kv.Key, kv => kv.Value), "lyrics.json");
+        Store.Save(LyricsByName.Where(kv => !kv.Value.Note).ToDictionary(kv => kv.Key, kv => kv.Value), "lyrics-v2.json");
         Store.Save(InfoById, "info.json");
         Store.Save(IdByTitle, "ids.json");
     }
@@ -236,42 +248,60 @@ public class Meter
     }
 }
 
-/// 가사 세 줄 창: 한 줄씩 넘어갈 때만 위로 미끄러지고, 탐색·건너뛰기로 크게 뛰면 그 자리로 바로 간다
+/// 가사 세 줄 창: 한 줄씩 넘어갈 때만 위로 미끄러지고, 탐색·건너뛰기로 크게 뛰면 그 자리로 바로 간다.
+/// 다음 곡으로 넘어가면 맨 위로 되감듯 이전 곡 가사는 아래로 빠지고 새 곡의 첫 줄이 위에서 내려온다.
 public class LyricsPanel : Canvas
 {
-    const double RowH = 24;
-    readonly StackPanel stack = new();
-    readonly TranslateTransform shift = new();
-    string key = "";
+    StackPanel stack = new();
+    TranslateTransform shift = new();
+    string key = "", song = "";
     int shown = -1;
 
-    public LyricsPanel(double width)
-    {
-        Width = width; Height = RowH * 3; ClipToBounds = true;
-        stack.Width = width; stack.RenderTransform = shift;
-        Children.Add(stack);
-    }
+    public LyricsPanel() { ClipToBounds = true; }  // 너비는 쓰는 쪽이 정한다(가사 크기에 따라)
+
+    static DoubleAnimation Ease(double to) => new(to, TimeSpan.FromSeconds(0.45)) { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } };
 
     public void Update(Lyrics? l, string song, double t, double length)
     {
         l ??= new Lyrics();
-        var k = $"{song}#{l.Lines.Count}#{l.Note}";
-        if (k != key)  // 곡이 바뀌거나 가사가 막 도착: 줄을 새로 깔고 그 자리에서 시작
+        double size = Prefs.Now.Size, rowH = size + 9;  // 가사 크기(설정)
+        var k = $"{song}#{l.Lines.Count}#{l.Note}#{size}#{Width}";
+        var next = false;
+        if (k != key)  // 곡이 바뀌거나 가사가 막 도착(또는 가사 크기를 바꿈): 줄을 새로 깔고 그 자리에서 시작
         {
             key = k; shown = -1;
-            stack.Children.Clear();
+            next = this.song.Length > 0 && song != this.song;  // 가사만 막 도착했을 땐 움직이지 않는다
+            this.song = song;
+            var old = stack;
+            if (next)
+            {
+                ((TranslateTransform)old.RenderTransform).BeginAnimation(TranslateTransform.YProperty, Ease(((TranslateTransform)old.RenderTransform).Y + Height));
+                var fade = Ease(0);
+                fade.Completed += (_, _) => Children.Remove(old);
+                old.BeginAnimation(OpacityProperty, fade);
+            }
+            else Children.Remove(old);
+            Height = rowH * 3;
+            stack = new StackPanel { Width = Width, RenderTransform = shift = new TranslateTransform() };
+            Children.Add(stack);
             foreach (var line in new[] { "♪" }.Concat(l.Lines.Select(x => x.Length == 0 ? "♪" : x)))
                 stack.Children.Add(new TextBlock
                 {
-                    Text = line, Height = RowH, FontSize = 15, Foreground = Brushes.White, TextAlignment = TextAlignment.Center,
+                    Text = line, Height = rowH, FontSize = size, Foreground = Brushes.White, TextAlignment = TextAlignment.Center,
                     TextTrimming = TextTrimming.CharacterEllipsis, VerticalAlignment = VerticalAlignment.Center,
                 });
         }
         var i = Core.LineIndex(l, t, length) + 1;
         if (i == shown) return;
-        var y = (1 - i) * RowH;  // i번째 줄이 가운데 칸에
-        if (shown >= 0 && i == shown + 1)
-            shift.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(y, TimeSpan.FromSeconds(0.45)) { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } });
+        var y = (1 - i) * rowH;  // i번째 줄이 가운데 칸에
+        if (next)
+        {
+            shift.Y = y - Height;
+            shift.BeginAnimation(TranslateTransform.YProperty, Ease(y));
+            stack.Opacity = 0;
+            stack.BeginAnimation(OpacityProperty, Ease(1));
+        }
+        else if (shown >= 0 && i == shown + 1) shift.BeginAnimation(TranslateTransform.YProperty, Ease(y));
         else { shift.BeginAnimation(TranslateTransform.YProperty, null); shift.Y = y; }
         for (var j = 0; j < stack.Children.Count; j++)
         {
@@ -324,7 +354,9 @@ static class Win
 /// 화면 위 가운데 아일랜드: 접히면 썸네일·곡 이름·막대, 마우스를 잠깐 올려 두면 곡·진행 바·가사·재생 버튼
 public class Island
 {
-    static readonly Size Small = new(320, 38), Big = new(380, 330);
+    static readonly Size Small = new(320, 38);
+    /// 펼친 모습. 가사 크기를 키우면 그만큼 넓고 길어진다.
+    static Size Big => new(Math.Round(380 * Math.Max(1, Prefs.Now.Size / 15)), 330 + 3 * (Prefs.Now.Size - 15));
     public readonly Window Window = Win.Overlay(Big.Width + 20, Big.Height + 20);
     readonly Model m;
     readonly Border pill = new() { Background = Brushes.Black, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Top, ClipToBounds = true };
@@ -337,7 +369,7 @@ public class Island
     readonly Border track = new() { Height = 3, CornerRadius = new CornerRadius(1.5), Background = new SolidColorBrush(Color.FromArgb(50, 255, 255, 255)), Margin = new Thickness(8, 0, 8, 0) };
     readonly Border fill = new() { Height = 3, CornerRadius = new CornerRadius(1.5), Background = Brushes.White, HorizontalAlignment = HorizontalAlignment.Left };
     readonly TextBlock play = Win.Icon("", 20);
-    readonly LyricsPanel lyrics = new(336);
+    readonly LyricsPanel lyrics = new();
     readonly Rectangle[] bars = Enumerable.Range(0, 4).Select(_ => new Rectangle { Width = 3, Height = 3, RadiusX = 1.5, RadiusY = 1.5, Fill = Brushes.White, Margin = new Thickness(1, 0, 1, 0), VerticalAlignment = VerticalAlignment.Center }).ToArray();
     bool expanded;
     DateTime? hoverSince;
@@ -406,6 +438,15 @@ public class Island
     public void Tick(bool show, double level, double t)
     {
         pill.Opacity = show ? 1 : 0;
+        var b = Big;
+        if (Window.Width != b.Width + 20 || Window.Height != b.Height + 20)  // 가사 크기를 바꿈
+        {
+            var area = SystemParameters.WorkArea;
+            Window.Width = b.Width + 20; Window.Height = b.Height + 20;
+            Window.Left = area.Left + (area.Width - Window.Width) / 2;
+            if (expanded) Resize(b, 22);
+        }
+        lyrics.Width = b.Width - 44;
         // 마우스 위치(물리 픽셀 → WPF 단위)
         var dpi = VisualTreeHelper.GetDpi(Window);
         var p = Forms.Control.MousePosition;
@@ -434,7 +475,7 @@ public class Island
         now.Text = Win.Clock(into); len.Text = Win.Clock(s.Length);
         fill.Width = Math.Max(0, track.ActualWidth * Math.Clamp(into / Math.Max(s.Length, 1), 0, 1));
         play.Text = m.Playing ? "" : "";
-        if (expanded) lyrics.Update(m.LyricsByName.GetValueOrDefault(s.Name), s.Name, into - Prefs.Now.Delay, s.Length);
+        if (expanded) lyrics.Update(m.LyricsByName.GetValueOrDefault(m.Key(s.Name)), s.Name, into - Prefs.Now.Delay, s.Length);
         // 막대: 브라우저 소리 크기를 따라, 칸마다 조금씩 다르게
         var sec = DateTime.Now.TimeOfDay.TotalSeconds;
         for (var k = 0; k < bars.Length; k++)
@@ -450,7 +491,7 @@ public class Floating
 {
     public readonly Window Window = Win.Overlay(460, 92);
     readonly Border bg = new() { CornerRadius = new CornerRadius(18), Padding = new Thickness(18, 10, 18, 10) };
-    readonly LyricsPanel lyrics = new(424);
+    readonly LyricsPanel lyrics = new();
     readonly Model m;
 
     public Floating(Model model)
@@ -472,8 +513,11 @@ public class Floating
         if (show != Window.IsVisible) { if (show) Window.Show(); else Window.Hide(); }
         if (!show) return;
         bg.Background = new SolidColorBrush(Color.FromArgb((byte)(Prefs.Now.Opacity * 255), 0, 0, 0));
+        double w = Math.Round(460 * Prefs.Now.Size / 15), h = 3 * (Prefs.Now.Size + 9) + 20;
+        if (Window.Width != w || Window.Height != h) { Window.Left += (Window.Width - w) / 2; Window.Width = w; Window.Height = h; }  // 가사 크기를 바꾸면 가운데·윗변은 그대로
+        lyrics.Width = w - 36;
         var s = m.Song;
-        lyrics.Update(m.LyricsByName.GetValueOrDefault(s.Name), s.Name, t - s.Start - Prefs.Now.Delay, s.Length);
+        lyrics.Update(m.LyricsByName.GetValueOrDefault(m.Key(s.Name)), s.Name, t - s.Start - Prefs.Now.Delay, s.Length);
     }
 }
 
@@ -518,6 +562,12 @@ public class SettingsWindow : Window
         panel.Children.Add(floatBox);
         island.Checked += (_, _) => { p.Mode = "island"; Prefs.Save(); floatBox.Visibility = Visibility.Collapsed; };
         floating.Checked += (_, _) => { p.Mode = "float"; Prefs.Save(); floatBox.Visibility = Visibility.Visible; };
+
+        var sizeLabel = Label($"가사 크기 {p.Size}");
+        panel.Children.Add(sizeLabel);
+        var size = new Slider { Minimum = 12, Maximum = 24, Value = p.Size, TickFrequency = 1, IsSnapToTickEnabled = true };
+        size.ValueChanged += (_, e) => { p.Size = Math.Round(e.NewValue); Prefs.Save(); sizeLabel.Text = $"가사 크기 {p.Size}"; };
+        panel.Children.Add(size);
 
         var delayLabel = Label($"가사 타이밍 {p.Delay:+0.0;-0.0;0.0}초");
         panel.Children.Add(delayLabel);

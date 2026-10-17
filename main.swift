@@ -116,7 +116,8 @@ func lineIndex(_ l: Lyrics, at t: Double, length: Double) -> Int {
 /// 검색어 후보(악센트는 풀어서: México → Mexico):
 /// 괄호 속(영문 제목, feat., MV …)을 뺀 것 → "가수 - 제목"이면 첫 가수 + 제목, 괄호 속 다른 이름 + 제목
 /// (여러 가수, 영문·한글 이름 중 하나만 맞아도 찾게) → 괄호만 푼 것 → (단일 곡 영상이면) 채널 이름을 붙인 것.
-func queries(_ name: String, author: String? = nil) -> [String] {
+/// hint(플리의 주인공 가수)가 있으면 "가수 + 곡 제목"을 맨 앞에: 곡 제목만 적은 플리에서 같은 제목의 다른 가수 곡을 피한다.
+func queries(_ name: String, author: String? = nil, hint: String? = nil) -> [String] {
     let name = name.applyingTransform(.stripDiacritics, reverse: false) ?? name
     func tidy(_ s: String) -> String {
         s.replacingOccurrences(of: #"(?i)\b(official|music video|lyrics?|audio|visualizer|m/?v)\b|가사|뮤직비디오|뮤비"#, with: " ", options: .regularExpression)
@@ -125,9 +126,13 @@ func queries(_ name: String, author: String? = nil) -> [String] {
     }
     func strip(_ s: String) -> String { s.replacingOccurrences(of: #"\([^)]*\)|\[[^\]]*\]|【[^】]*】"#, with: " ", options: .regularExpression) }
     var qs = [tidy(strip(name))]
+    if let hint { qs.insert(tidy(hint + " " + strip(name)), at: 0) }
     if let r = name.range(of: #"\s+[-–—]\s+|_"#, options: .regularExpression) {
         let artist = String(name[..<r.lowerBound]), title = tidy(strip(String(name[r.upperBound...])))
         qs.append(tidy(strip(artist).components(separatedBy: CharacterSet(charactersIn: ",&")).first ?? artist) + " " + title)
+        // "곡 - 가수" 순서일 수도 있어서 반대로도("하지마 - 릴러말즈, TOIL" → "릴러말즈 하지마")
+        let right = strip(String(name[r.upperBound...]))
+        qs.append(tidy(right.components(separatedBy: CharacterSet(charactersIn: ",&")).first ?? right) + " " + tidy(strip(artist)))
         qs += artist.matches(of: #/\(([^)]*)\)/#).map { tidy(String($0.1)) + " " + title }
     }
     qs.append(tidy(name))
@@ -177,7 +182,7 @@ func fetch(_ url: String, _ query: [String: String] = [:], body: Data? = nil) as
     let host = c.host ?? "", lrclib = host == "lrclib.net"
     var req = URLRequest(url: c.url!)
     // LRCLIB는 앱 이름을 밝혀 달라고 한다. 유튜브·벅스는 브라우저처럼.
-    req.setValue(lrclib ? "YouTubeLyricNotch/1.2.0 (personal macOS app)" : "Mozilla/5.0 (youtube-notch, personal)", forHTTPHeaderField: "User-Agent")
+    req.setValue(lrclib ? "YouTubeLyricNotch/1.2.1 (personal macOS app)" : "Mozilla/5.0 (youtube-notch, personal)", forHTTPHeaderField: "User-Agent")
     req.timeoutInterval = 8  // 서버가 늘어지면 기본 60초를 기다리게 된다
     if let body { req.httpMethod = "POST"; req.httpBody = body; req.setValue("application/json", forHTTPHeaderField: "Content-Type") }
     for attempt in 0..<3 {
@@ -201,10 +206,52 @@ func parseBugs(_ s: String) -> Lyrics {
     return Lyrics(lines: pairs.map { $0.1 }, times: pairs.map { $0.0 })
 }
 
-/// 벅스 곡 검색 결과에서 제목이 우리 곡 이름과 맞는 첫 곡의 id(반주 버전은 가사가 없으니 건너뜀)
-func bugsTrack(_ html: String, for name: String) -> String? {
-    html.matches(of: #/value="(\d+)" name="check" disc_id="\d+" title="([^"]*)"/#)
-        .first { !$0.2.contains("Inst.") && sameSong(name, String($0.2)) }.map { String($0.1) }
+/// 검색 결과의 가수(여러 명·괄호 속 다른 이름 중 하나라도)가 곡 이름·영상 제목·채널 어딘가에 나오나
+func artistIn(_ artist: String, _ context: String) -> Bool {
+    let c = squash(context)
+    return artist.replacingOccurrences(of: #"(?i)\s+(feat\.?|ft\.?|with|x)\s+"#, with: ",", options: .regularExpression)
+        .replacingOccurrences(of: #"\(([^)]*)\)"#, with: ",$1,", options: .regularExpression)
+        .components(separatedBy: CharacterSet(charactersIn: ",&×/"))
+        .map(squash).contains { $0.count >= 2 && c.contains($0) }
+}
+
+/// 플리 영상 제목에 나온 낱말 중 타임라인 곡 이름들에 가장 자주(2곡 이상) 나오는 것 = 그 플리의 주인공 가수.
+/// "릴러말즈 노래모음"처럼 가수를 빼고 곡 제목만 적은 플리에서 검색어와 가수 확인에 쓴다.
+func playlistArtist(title: String, tracks: [Track]) -> String? {
+    let names = tracks.map { squash($0.name) }
+    let words = Set(title.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count >= 2 })
+    let best = words.map { w in (w, names.filter { $0.contains(squash(w)) }.count) }.max { $0.1 < $1.1 }
+    return best.flatMap { $0.1 >= 2 ? $0.0 : nil }
+}
+
+let bugsRow = try! NSRegularExpression(pattern: #"<tr[^>]*trackId="\d+".*?</tr>"#, options: .dotMatchesLineSeparators)
+
+let bugsArtist = try! NSRegularExpression(pattern: #"<p class="artist">.*?<a [^>]*title="([^"]*)""#, options: .dotMatchesLineSeparators)
+
+/// 벅스 곡 검색 결과에서 제목이 맞는 곡들(반주 버전은 가사가 없으니 빼고): id와 가수.
+/// 가수 칸 앞에 HTML 주석이 끼는 줄(여러 가수)이 있어 주석을 건너뛰고 첫 가수를 읽는다.
+func bugsCandidates(_ html: String, for name: String) -> [(id: String, artist: String)] {
+    let ns = html as NSString
+    return bugsRow.matches(in: html, range: NSRange(location: 0, length: ns.length)).compactMap { m in
+        let row = ns.substring(with: m.range), rs = row as NSString
+        guard let t = row.firstMatch(of: #/value="(\d+)" name="check" disc_id="\d+" title="([^"]*)"/#),
+              let a = bugsArtist.firstMatch(in: row, range: NSRange(location: 0, length: rs.length)),
+              !t.2.contains("Inst."), sameSong(name, String(t.2)) else { return nil }
+        return (String(t.1), rs.substring(with: a.range(at: 1)))
+    }
+}
+
+/// 제목과 가수가 둘 다 맞는 첫 곡(같은 제목의 다른 가수 곡이 위에 오는 일이 많다)
+func bugsTrack(_ html: String, for name: String, context: String) -> String? {
+    bugsCandidates(html, for: name).first { artistIn($0.artist, context) }?.id
+}
+
+/// 벅스 곡 페이지의 재생 시간(초). 검색 결과에는 곡 길이가 없다.
+func bugsLength(_ id: String) async -> Double? {
+    guard let d = await fetch("https://music.bugs.co.kr/track/\(id)") else { return nil }
+    let text = String(decoding: d, as: UTF8.self).replacingOccurrences(of: #"<[^>]+>"#, with: " ", options: .regularExpression)
+    guard let m = text.firstMatch(of: #/재생 ?시간[^0-9]{0,200}(\d{1,2}):(\d{2})/#) else { return nil }
+    return Double(m.1)! * 60 + Double(m.2)!
 }
 
 func plainLines(_ s: String) -> Lyrics { Lyrics(lines: s.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) }
@@ -214,36 +261,45 @@ typealias Found = (synced: Lyrics?, plain: Lyrics?, failed: Bool)
 
 /// LRCLIB(영어권 강함)와 벅스(국내 곡 강함)에 함께 물어 싱크 가사 > 일반 가사. 제목이 안 맞는 결과는 버린다.
 /// nil: 어딘가에 닿지 못해(오프라인, 요청 제한) 못 찾았을 수 있음 → 나중에 다시
-func fetchLyrics(_ name: String, author: String?, length: Double) async -> Lyrics? {
-    let qs = queries(name, author: author)
-    async let bugs = bugsLyrics(name, Array(qs.prefix(3)))
-    let lrc = await lrclibLyrics(name, qs, length)
+/// context: 영상 제목·채널. 결과의 가수가 곡 이름·hint·context 어딘가에 있거나 곡 길이가 비슷해야 같은 곡으로 본다.
+func fetchLyrics(_ name: String, author: String?, hint: String? = nil, context: String = "", length: Double) async -> Lyrics? {
+    let qs = queries(name, author: author, hint: hint)
+    let ctx = [name, hint ?? "", context].joined(separator: " ")
+    async let bugs = bugsLyrics(name, ctx, Array(qs.prefix(3)), length)
+    let lrc = await lrclibLyrics(name, ctx, qs, length)
     if let s = lrc.synced { return s }  // 벅스 쪽은 취소된다
     let b = await bugs
     return b.synced ?? lrc.plain ?? b.plain ?? (lrc.failed || b.failed ? nil : .note("가사를 못 찾았어요"))
 }
 
-func lrclibLyrics(_ name: String, _ qs: [String], _ length: Double) async -> Found {
+func lrclibLyrics(_ name: String, _ ctx: String, _ qs: [String], _ length: Double) async -> Found {
     var plain: Lyrics?, failed = false
     for q in qs.prefix(3) {  // 요청 제한이 빡빡해서 세 번까지
         guard let d = await fetch("https://lrclib.net/api/search", ["q": q]) else { failed = true; continue }
         guard let hits = try? JSONDecoder().decode([Hit].self, from: d) else { continue }
-        // 제목이 맞는 것만. 싱크 가사, 가수까지 맞는 것, 곡 길이가 비슷한 것 우선
-        let cost = { (h: Hit) in
-            abs((h.duration ?? length) - length) + (h.syncedLyrics == nil ? 30 : 0) + (sameSong(name, h.artistName ?? "") ? 0 : 20)
-        }
-        let best = hits.filter { ($0.syncedLyrics != nil || $0.plainLyrics != nil) && sameSong(name, $0.trackName ?? "") }.min { cost($0) < cost($1) }
+        // 제목이 맞고, 가수가 맞거나(곡 이름·영상 제목·채널에 나옴) 곡 길이가 비슷한 것만. 같은 제목의 다른 가수 곡을 막는다.
+        // 그중 싱크 가사, 가수까지 맞는 것, 곡 길이가 비슷한 것 우선
+        let artistOK = { (h: Hit) in artistIn(h.artistName ?? "", ctx) }
+        let lengthOK = { (h: Hit) in h.duration.map { length > 0 && abs($0 - length) <= max(6, length * 0.05) } ?? false }
+        let cost = { (h: Hit) in abs((h.duration ?? length) - length) + (h.syncedLyrics == nil ? 30 : 0) + (artistOK(h) ? 0 : 20) }
+        let best = hits.filter { ($0.syncedLyrics != nil || $0.plainLyrics != nil) && sameSong(name, $0.trackName ?? "") && (artistOK($0) || lengthOK($0)) }
+            .min { cost($0) < cost($1) }
         if let s = best?.syncedLyrics, !s.isEmpty { return (parseLRC(s), nil, false) }
         if plain == nil, let p = best?.plainLyrics, !p.isEmpty { plain = plainLines(p) }
     }
     return (nil, plain, failed)
 }
 
-func bugsLyrics(_ name: String, _ qs: [String]) async -> Found {
+func bugsLyrics(_ name: String, _ ctx: String, _ qs: [String], _ length: Double) async -> Found {
     var id: String?, failed = false
-    for q in qs where id == nil {  // 제목이 맞는 곡이 나올 때까지 검색어를 바꿔 가며
+    search: for q in qs {  // 맞는 곡이 나올 때까지 검색어를 바꿔 가며
         guard let d = await fetch("https://music.bugs.co.kr/search/track", ["q": q]) else { failed = true; continue }
-        id = bugsTrack(String(decoding: d, as: UTF8.self), for: name)
+        let found = bugsCandidates(String(decoding: d, as: UTF8.self), for: name)
+        if let c = found.first(where: { artistIn($0.artist, ctx) }) { id = c.id; break }
+        // 가수 표기가 달라(빅나티 ↔ BIG Naughty (서동현)) 안 맞으면 곡 길이로: 재생 시간이 타임라인 구간과 비슷한지(후보 3개까지)
+        for c in found.prefix(3) where length > 0 {
+            if let l = await bugsLength(c.id), abs(l - length) <= max(6, length * 0.05) { id = c.id; break search }
+        }
     }
     guard let id else { return (nil, nil, failed) }
     func text(_ d: Data?) -> String? { d.flatMap { try? JSONDecoder().decode(BugsLyrics.self, from: $0) }?.lyrics.flatMap { $0.isEmpty ? nil : $0 } }
@@ -276,18 +332,34 @@ if CommandLine.arguments.contains("--selftest") {
     let o = parseLRC("[ar:IU]\n[offset:+500]\n[00:02.00]a\n[00:02.00]b\n[00:03.00]<00:03.10>c <00:03.50>d")
     precondition(o.lines == ["a / b", "c d"] && o.times == [1.5, 2.5], "\(o)")
     let q = queries("아이유 (IU) - 밤편지 (Through the Night) [MV]")
-    precondition(q == ["아이유 밤편지", "IU 밤편지", "아이유 IU 밤편지 Through the Night"], "\(q)")
-    precondition(queries("CHUNG HA (청하) - México") == ["CHUNG HA Mexico", "청하 Mexico", "CHUNG HA 청하 Mexico"], "\(queries("CHUNG HA (청하) - México"))")
+    precondition(q == ["아이유 밤편지", "밤편지 아이유", "IU 밤편지", "아이유 IU 밤편지 Through the Night"], "\(q)")
+    precondition(queries("CHUNG HA (청하) - México") == ["CHUNG HA Mexico", "Mexico CHUNG HA", "청하 Mexico", "CHUNG HA 청하 Mexico"], "\(queries("CHUNG HA (청하) - México"))")
+    precondition(Array(queries("하지마 - 릴러말즈, TOIL").prefix(2)) == ["하지마 릴러말즈 TOIL", "릴러말즈 하지마"])
     precondition(queries("파테코, 제이씨유카, Kid Wine - 널 떠올리는 중이야")[1] == "파테코 널 떠올리는 중이야")
     precondition(sameSong("CHUNG HA (청하) - México", "Mexico") && squash("밤편지") == "밤편지")
     precondition(queries("현서 (HYUN SEO)_널 떠나보내기엔 너무 아프지만 (Feat. 이을 (E.ul))")[0] == "현서 널 떠나보내기엔 너무 아프지만")
     precondition(jsonFields(#"x"author":"a","shortDescription":"0:00 \"곡\"\n1:00 b","author":"핑프""#, "author") == ["a", "핑프"])
     let b = parseBugs("11.0|난 아직＃23.5|i want to see you again＃끝")
     precondition(b.lines == ["난 아직", "i want to see you again"] && b.times == [11, 23.5])
-    let row = #"<tr trackId="6170006"><input type="checkbox" value="6170006" name="check" disc_id="1" title="See you again (Feat. A &amp; B)">"#
-    precondition(bugsTrack(row, for: "소수빈_See you again") == "6170006" && bugsTrack(row, for: "다른 곡") == nil)
-    let rows = #"value="1" name="check" disc_id="1" title="Rainbow days come after rain" value="2" name="check" disc_id="1" title="RAINBOW (Inst.)" value="3" name="check" disc_id="1" title="RAINBOW""#
-    precondition(bugsTrack(rows, for: "PL (피엘)_RAINBOW") == "3")
+    func row(_ id: Int, _ title: String, _ artist: String) -> String {
+        #"<tr trackId="\#(id)"><input type="checkbox" value="\#(id)" name="check" disc_id="1" title="\#(title)"><p class="artist"><a href="x" title="\#(artist)">\#(artist)</a></p></tr>"#
+    }
+    precondition(bugsTrack(row(6170006, "See you again (Feat. A &amp; B)", "소수빈"), for: "소수빈_See you again", context: "소수빈_See you again") == "6170006")
+    precondition(bugsTrack(row(1, "다른 곡", "소수빈"), for: "See you again", context: "") == nil)
+    let rows = row(1, "Rainbow days come after rain", "Drew") + row(2, "RAINBOW (Inst.)", "PL(피엘)") + row(3, "RAINBOW", "PL(피엘)")
+    precondition(bugsTrack(rows, for: "PL (피엘)_RAINBOW", context: "PL (피엘)_RAINBOW") == "3")
+    // 같은 제목, 다른 가수: 곡 제목만 적힌 플리에서 성시경의 "거리에서"를 고르지 않는다
+    let same = row(1, "거리에서", "성시경") + row(2, "거리에서", "김광석") + row(3, "거리에서 (Feat. ASH ISLAND)", "릴러말즈 (Leellamarz)")
+    precondition(bugsTrack(same, for: "거리에서 (Feat. ASH ISLAND)", context: "거리에서 (Feat. ASH ISLAND) 릴러말즈 [Playlist] 릴러말즈 노래모음 |Leellamarz|") == "3")
+    precondition(bugsTrack(row(1, "거리에서", "성시경"), for: "거리에서", context: "거리에서 [Playlist] 감성힙합 모음") == nil)
+    // 여러 가수인 줄은 가수 칸 앞에 HTML 주석이 낀다
+    let multi = #"<tr trackId="7"><input type="checkbox" value="7" name="check" disc_id="1" title="하지마"><p class="artist"> <!-- a tag title --> <a href="x" class="artistTitle" title="릴러말즈 (Leellamarz)">릴러말즈</a> <a href="javascript:void(0);" class="more" title="아티스트 전체보기">x</a></p></tr>"#
+    precondition(bugsTrack(multi, for: "하지마 - 릴러말즈, TOIL", context: "하지마 - 릴러말즈, TOIL") == "7")
+    precondition(artistIn("Leellamarz, ASH ISLAND", "릴러말즈 (Leellamarz)_거리에서") && artistIn("IU (아이유)", "아이유 - 밤편지") && !artistIn("성시경", "릴러말즈 노래모음"))
+    let lr = timeline("0:00 거리에서 (Feat. ASH ISLAND)\n3:29 Trip (Feat. Hannah)\n7:23 하지마 - 릴러말즈, TOIL\n9:00 RUN - 릴러말즈, Panda Gomm")
+    precondition(playlistArtist(title: "[Playlist] 설렘 가득 감성힙합 릴러말즈 노래모음 |Leellamarz|", tracks: lr) == "릴러말즈")
+    precondition(playlistArtist(title: "[Playlist] 감성 플리", tracks: lr) == nil)
+    precondition(queries("거리에서 (Feat. ASH ISLAND)", hint: "릴러말즈").first == "릴러말즈 거리에서")
     precondition(sameSong("아이유 - 밤편지", "Through the Night (밤편지)") && sameSong("JAEHA (재하)_3　2　1", "3 2 1"))
     precondition(!sameSong("Crush - Whatever You Do (Feat. GRAY)", "Other (Feat. GRAY)") && !sameSong("dori_2 O' CLOCK", "Yours"))
     // 곡 알아내는 순서
@@ -473,7 +545,11 @@ final class Model: ObservableObject {
     @Published var video: Video?
     @Published var problem: String?
     @Published var expanded = false
-    @Published var lyrics: [String: Lyrics] = Store.load("lyrics.json") ?? [:]  // 곡 이름 → 가사
+    // "영상 id|곡 이름" → 가사. 곡 이름만으로는 다른 플리의 같은 제목 곡과 섞여서 영상별로 둔다
+    // (파일 이름을 바꿔, 예전에 같은 제목의 다른 가수 곡으로 잘못 저장된 가사는 버린다)
+    @Published var lyrics: [String: Lyrics] = Store.load("lyrics-v2.json") ?? [:]
+    var hint: String?  // 플리의 주인공 가수(곡 제목만 적은 플리에서 검색어·가수 확인에)
+    var context = ""   // 영상 제목·채널(검색 결과의 가수 확인에)
     var info: [String: Info] = Store.load("info.json") ?? [:]  // 영상 id → 설명란·댓글, 채널, 분류(저장해 둔 걸 먼저 쓰고 새로 받아 바꾼다)
     var dirty = false  // 디스크에 아직 안 쓴 게 있음
     var last: (json: String, tab: NSAppleEventDescriptor, at: Date)?  // 마지막으로 읽은 영상(설명란이 오자마자 다시 반영하려고)
@@ -564,12 +640,14 @@ final class Model: ObservableObject {
         // 결과가 도착한 때가 아니라 페이지가 읽은 순간 기준(그 사이 Chrome이나 앱이 바빴으면 그만큼 어긋나던 것)
         polledAt = v.at.map { Date(timeIntervalSince1970: $0 / 1000) } ?? at
         tracks = found
+        hint = playlistArtist(title: v.title, tracks: found)
+        context = v.title + " " + meta.author
         single = one
 
         let s = song
         // 곡을 못 알아낸 긴 영상(타임라인 없는 플리·라이브 …)은 제목으로 가사를 찾지 않는다
         if songs == .none {
-            if lyrics[s.name] == nil { lyrics[s.name] = .note("타임라인을 못 찾았어요") }
+            if lyrics[key(s.name)] == nil { lyrics[key(s.name)] = .note("타임라인을 못 찾았어요") }
             return
         }
         want(s.name, author: single?.author, length: s.length)
@@ -577,30 +655,35 @@ final class Model: ObservableObject {
         // 요청 제한을 피하려고 한 번에 한 곡, 1초씩 쉬어 가며.
         guard loading.isEmpty, Date().timeIntervalSince(lastFetch) > 1, !tracks.isEmpty else { return }
         let i = tracks.lastIndex { $0.start <= t } ?? 0
-        if let k = (Array(i + 1..<tracks.count) + Array(0..<i)).first(where: { lyrics[tracks[$0].name] == nil }) {
+        if let k = (Array(i + 1..<tracks.count) + Array(0..<i)).first(where: { lyrics[key(tracks[$0].name)] == nil }) {
             let end = k + 1 < tracks.count ? tracks[k + 1].start : v.duration
             want(tracks[k].name, author: nil, length: end - tracks[k].start)
         }
     }
 
     /// 그 곡 가사를 아직 안 찾았으면 찾기 시작
+    func key(_ name: String) -> String { "\(video?.id ?? "")|\(name)" }
+
     func want(_ name: String, author: String?, length: Double) {
-        guard lyrics[name] == nil else { return }
+        let k = key(name)
+        guard lyrics[k] == nil else { return }
         // "광고 스킵", "intro" 같은 타임라인 메모는 곡이 아니다
-        if name.range(of: #"(?i)^\s*(광고|ad\b|intro|인트로|outro|아웃트로)"#, options: .regularExpression) != nil { lyrics[name] = .note("♪"); return }
-        lyrics[name] = .note("가사 찾는 중…")
-        loading.insert(name)
+        if name.range(of: #"(?i)^\s*(광고|ad\b|intro|인트로|outro|아웃트로)"#, options: .regularExpression) != nil { lyrics[k] = .note("♪"); return }
+        lyrics[k] = .note("가사 찾는 중…")
+        loading.insert(k)
+        // 곡 이름에 이미 그 가수가 있으면 hint는 안 붙인다
+        let hint = self.hint.flatMap { squash(name).contains(squash($0)) ? nil : $0 }, context = self.context
         Task {
-            let l = await fetchLyrics(name, author: author, length: length)
+            let l = await fetchLyrics(name, author: author, hint: hint, context: context, length: length)
             await MainActor.run {
-                self.loading.remove(name)
+                self.loading.remove(k)
                 self.lastFetch = Date()
                 if l?.note == false { self.dirty = true }
                 // 서버에 못 닿았으면 30초 뒤 다시, 세 번까지(특정 검색어에만 계속 503을 주는 경우가 있다)
-                let n = l == nil ? self.tries[name, default: 0] + 1 : 0
-                self.tries[name] = n
-                self.lyrics[name] = l ?? .note(n < 3 ? "가사 서버에 연결 못 함, 30초 뒤 다시" : "가사를 못 찾았어요")
-                if l == nil && n < 3 { DispatchQueue.main.asyncAfter(deadline: .now() + 30) { self.lyrics[name] = nil } }
+                let n = l == nil ? self.tries[k, default: 0] + 1 : 0
+                self.tries[k] = n
+                self.lyrics[k] = l ?? .note(n < 3 ? "가사 서버에 연결 못 함, 30초 뒤 다시" : "가사를 못 찾았어요")
+                if l == nil && n < 3 { DispatchQueue.main.asyncAfter(deadline: .now() + 30) { self.lyrics[k] = nil } }
             }
         }
     }
@@ -609,7 +692,7 @@ final class Model: ObservableObject {
     func save() {
         guard dirty else { return }
         dirty = false
-        Store.save(lyrics.filter { !$0.value.note }, "lyrics.json")
+        Store.save(lyrics.filter { !$0.value.note }, "lyrics-v2.json")
         Store.save(info, "info.json")
     }
 
@@ -647,7 +730,7 @@ final class Model: ObservableObject {
     /// 지금 부르는 가사 한 줄. 가사가 없거나 안내 문구뿐이면 nil
     var line: String? {
         let s = song
-        guard let l = lyrics[s.name], !l.note else { return nil }
+        guard let l = lyrics[key(s.name)], !l.note else { return nil }
         let i = lineIndex(l, at: t - s.start - lyricDelay, length: s.length)
         return l.lines.indices.contains(i) && !l.lines[i].isEmpty ? l.lines[i] : "♪"
     }
@@ -687,7 +770,8 @@ let notch = CGSize(width: hasNotch ? screen.frame.width - (screen.auxiliaryTopLe
                    height: hasNotch ? screen.safeAreaInsets.top : NSStatusBar.system.thickness)
 let wing = notch.height + 10  // 노치 양옆으로 삐져나오는 폭(썸네일·막대 한 칸)
 let small = CGSize(width: notch.width + wing * 2, height: notch.height)
-let big = CGSize(width: max(small.width, 380), height: notch.height + 300)
+/// 펼친 노치. 가사 크기를 키우면 그만큼 넓고 길어진다.
+var big: CGSize { CGSize(width: max(small.width, (380 * max(1, lyricSize / 15)).rounded()), height: notch.height + 300 + 3 * (lyricSize - 15)) }
 let compact = CGSize(width: max(small.width, 330), height: notch.height + 50)  // 곡 없이 안내 한 줄
 
 func clock(_ s: Double) -> String { let s = max(0, Int(s)); return String(format: "%d:%02d", s / 60, s % 60) }
@@ -840,7 +924,7 @@ struct LockCard: View {
                         Spacer(minLength: 0)
                     }
                     n.progress
-                    LyricsView(m: m, now: m.t)
+                    LyricsView(m: m, now: m.t, scaled: false)
                     n.controls(v)
                 }
                 .padding(18)
@@ -892,30 +976,39 @@ func isLocked() -> Bool { (CGSessionCopyCurrentDictionary() as? [String: Any])?[
 struct LyricsView: View {
     @ObservedObject var m: Model
     let now: Double  // 영상 시간. 부모의 0.25초 타이머가 넘겨 줘야 가사가 제때 넘어간다(m만으로는 Chrome을 읽을 때만 다시 그려짐)
+    var scaled = true  // 가사 크기 설정을 따를지(잠금 화면 카드는 크기가 정해져 있어 그대로)
     @AppStorage("lyricDelay") var delay = 0.5  // 가사 타이밍(설정)
+    @AppStorage("lyricSize") var setSize = 15.0  // 가사 크기(설정)
     @State private var shown = 0  // 직전에 보여 준 줄
 
     var body: some View {
-        let s = m.song, l = m.lyrics[s.name] ?? Lyrics()
+        let s = m.song, l = m.lyrics[m.key(s.name)] ?? Lyrics()
         let rows = ["♪"] + l.lines.map { $0.isEmpty ? "♪" : $0 }  // 맨 앞 ♪ = 첫 줄 전 전주
-        let i = lineIndex(l, at: now - s.start - delay, length: s.length) + 1, rowH: CGFloat = 22
-        VStack(spacing: 0) {
-            ForEach(rows.indices, id: \.self) { j in
-                Text(rows[j])
-                    .font(.system(size: 15, weight: .semibold))
-                    .lineLimit(1)
-                    .scaleEffect(j == i ? 1 : 0.82)
-                    .opacity(j == i ? 1 : abs(j - i) == 1 ? 0.4 : 0)
-                    .frame(maxWidth: .infinity, minHeight: rowH, maxHeight: rowH)
+        let i = lineIndex(l, at: now - s.start - delay, length: s.length) + 1, size = scaled ? setSize : 15, rowH = size + 7
+        ZStack {
+            VStack(spacing: 0) {
+                ForEach(rows.indices, id: \.self) { j in
+                    Text(rows[j])
+                        .font(.system(size: size, weight: .semibold))
+                        .lineLimit(1)
+                        .scaleEffect(j == i ? 1 : 0.82)
+                        .opacity(j == i ? 1 : abs(j - i) == 1 ? 0.4 : 0)
+                        .frame(maxWidth: .infinity, minHeight: rowH, maxHeight: rowH)
+                }
             }
+            .offset(y: CGFloat(1 - i) * rowH)  // i번째 줄이 가운데 칸에
+            .frame(height: rowH * 3, alignment: .top)
+            .animation(i == shown + 1 ? .spring(response: 0.5, dampingFraction: 0.9) : nil, value: i)
+            .onAppear { shown = i }
+            .onChange(of: i) { _, new in shown = new }
+            .id("\(m.key(s.name))#\(rows.count)")  // 곡이 바뀌거나 가사가 막 도착하면 그 자리에서 시작
+            // 다음 곡으로 넘어가면 맨 위로 되감듯: 이전 곡 가사는 아래로 빠지고 새 곡의 첫 줄이 위에서 내려온다
+            .transition(.asymmetric(insertion: .move(edge: .top).combined(with: .opacity),
+                                    removal: .move(edge: .bottom).combined(with: .opacity)))
         }
-        .offset(y: CGFloat(1 - i) * rowH)  // i번째 줄이 가운데 칸에
-        .frame(height: rowH * 3, alignment: .top)
+        .frame(height: rowH * 3)
         .clipped()
-        .animation(i == shown + 1 ? .spring(response: 0.5, dampingFraction: 0.9) : nil, value: i)
-        .onAppear { shown = i }
-        .onChange(of: i) { _, new in shown = new }
-        .id("\(s.name)#\(rows.count)")  // 곡이 바뀌거나 가사가 막 도착하면 그 자리에서 시작
+        .animation(.spring(response: 0.6, dampingFraction: 0.9), value: m.key(s.name))  // 가사만 막 도착했을 땐 움직이지 않는다
     }
 }
 
@@ -928,10 +1021,14 @@ var floating: Bool { UserDefaults.standard.string(forKey: "mode") == "float" }
 /// (측정: 다음 곡 소리가 타임라인보다 0.55초 늦게 시작). 그래서 기본은 0.5초 늦게, 설정에서 귀에 맞게 조절.
 var lyricDelay: Double { UserDefaults.standard.object(forKey: "lyricDelay") as? Double ?? 0.5 }
 
+/// 가사 글자 크기(기본 15). 노치와 떠 있는 가사 창이 이에 맞춰 커진다.
+var lyricSize: Double { UserDefaults.standard.object(forKey: "lyricSize") as? Double ?? 15 }
+
 struct SettingsView: View {
     @AppStorage("mode") var mode = "notch"
     @AppStorage("floatOpacity") var opacity = 0.3
     @AppStorage("lyricDelay") var delay = 0.5
+    @AppStorage("lyricSize") var size = 15.0
     @AppStorage("showMenuIcon") var menuIcon = true
     @State private var login = SMAppService.mainApp.status == .enabled
 
@@ -946,6 +1043,7 @@ struct SettingsView: View {
                 Slider(value: $opacity, in: 0...0.8) { Text("배경 진하기") }
                 Text("가사 창은 끌어서 원하는 곳으로 옮길 수 있어요. 0이면 배경 없이 글자만 보여요.").font(.caption).foregroundStyle(.secondary)
             }
+            Slider(value: $size, in: 12...24, step: 1) { Text("가사 크기 \(Int(size))") }
             Slider(value: $delay, in: -1...2, step: 0.1) { Text("가사 타이밍 \(String(format: "%+.1f", delay))초") }
             Text("가사가 노래보다 먼저 넘어가면 늘리고, 늦게 넘어가면 줄여 주세요.").font(.caption).foregroundStyle(.secondary)
             Toggle("메뉴 막대에 아이콘 보이기", isOn: $menuIcon)
@@ -961,7 +1059,7 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         // 그룹 폼은 안에서 스크롤돼 스스로 높이를 정하지 않는다(창이 제목 줄만 남는다). 방식마다 높이를 정해 준다.
-        .frame(width: 400, height: (mode == "float" ? 390 : 310) + (menuIcon ? 45 : 90))
+        .frame(width: 400, height: (mode == "float" ? 430 : 350) + (menuIcon ? 45 : 90))
     }
 }
 
@@ -999,7 +1097,8 @@ struct FloatingLyrics: View {
         }
     }
 }
-let floatSize = CGSize(width: 460, height: 86)
+/// 떠 있는 가사 창 크기: 가사 크기에 맞춰
+var floatSize: CGSize { CGSize(width: (460 * lyricSize / 15).rounded(), height: 3 * (lyricSize + 7) + 20) }
 
 /// 아무 데나 잡고 끌면 창이 옮겨지게
 final class DragHost<V: View>: NSHostingView<V> {
@@ -1134,6 +1233,10 @@ Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
     if statusItem.isVisible != icon { statusItem.isVisible = icon }
     let show = floating && model.video != nil  // 떠 있는 가사 창은 그 방식을 골랐고 곡이 있을 때만
     if show != floatPanel.isVisible { show ? floatPanel.orderFrontRegardless() : floatPanel.orderOut(nil) }
+    // 가사 크기를 바꾸면 창도 맞춰서(노치는 화면 위 가운데, 떠 있는 가사 창은 가운데·윗변을 그대로)
+    let b = big, f = floatPanel.frame, fs = floatSize
+    if panel.frame.size != b { panel.setFrame(NSRect(x: screen.frame.midX - b.width / 2, y: screen.frame.maxY - b.height, width: b.width, height: b.height), display: true) }
+    if f.size != fs { floatPanel.setFrame(NSRect(x: f.midX - fs.width / 2, y: f.maxY - fs.height, width: fs.width, height: fs.height), display: true) }
     let s = model.size
     let r = NSRect(x: screen.frame.midX - s.width / 2, y: screen.frame.maxY - s.height, width: s.width, height: s.height + 1)
     let hover = model.visible && r.contains(NSEvent.mouseLocation)
