@@ -3,7 +3,8 @@
 // 플리 영상(한 영상에 여러 곡)은 설명란·댓글의 타임라인으로 지금 곡을 찾는다. 가사는 LRCLIB → 벅스 순으로 찾는다.
 // 준비(한 번만): Chrome 메뉴 보기 > 개발자 > 'Apple Events의 자바스크립트 허용'
 // 빌드: swiftc -O main.swift -o notch    실행: ./notch    점검: ./notch --selftest    설치용 앱·dmg: ./release.sh
-// 노치를 펼친 채 우클릭: 로그인할 때 자동으로 열기, 종료
+// 설정(가사 보기 방식, 떠 있는 가사 창 배경, 가사 타이밍, 메뉴 막대 아이콘, 자동 실행, 종료): 펼친 노치 왼쪽 위 ⚙️, 메뉴 막대 ♪,
+// 또는 아이콘을 숨겼으면 응용 프로그램에서 앱을 다시 열기
 import AppKit
 import MediaPlayer
 import ServiceManagement
@@ -176,7 +177,7 @@ func fetch(_ url: String, _ query: [String: String] = [:], body: Data? = nil) as
     let host = c.host ?? "", lrclib = host == "lrclib.net"
     var req = URLRequest(url: c.url!)
     // LRCLIB는 앱 이름을 밝혀 달라고 한다. 유튜브·벅스는 브라우저처럼.
-    req.setValue(lrclib ? "YouTubeLyricNotch/1.1.1 (personal macOS app)" : "Mozilla/5.0 (youtube-notch, personal)", forHTTPHeaderField: "User-Agent")
+    req.setValue(lrclib ? "YouTubeLyricNotch/1.2.0 (personal macOS app)" : "Mozilla/5.0 (youtube-notch, personal)", forHTTPHeaderField: "User-Agent")
     req.timeoutInterval = 8  // 서버가 늘어지면 기본 60초를 기다리게 된다
     if let body { req.httpMethod = "POST"; req.httpBody = body; req.setValue("application/json", forHTTPHeaderField: "Content-Type") }
     for attempt in 0..<3 {
@@ -317,7 +318,7 @@ let js = """
   const v = document.querySelector('#movie_player video'), id = new URLSearchParams(location.search).get('v');
   if (!v || !id) return '';
   return JSON.stringify({ id, title: document.title.replace(/^[(][0-9]+[)] /, '').replace(/ - YouTube$/, ''),
-    time: v.currentTime, duration: v.duration || 0, playing: !v.paused,
+    time: v.currentTime, at: Date.now(), duration: v.duration || 0, playing: !v.paused,
     ad: document.getElementById('movie_player').classList.contains('ad-showing') });
 } catch (e) { return ''; } })()
 """
@@ -431,16 +432,19 @@ enum Chrome {
 
     /// 유튜브 영상 탭을 읽는다. 재생 중인 탭 우선. 꺼져 있으면 깨우지 않는다.
     /// 자바스크립트 허용은 Chrome 프로필마다 따로라, 읽히는 탭이 하나도 없을 때만 오류로 알린다.
-    static func read() -> Result<(json: String, tab: NSAppleEventDescriptor)?, NSError> {
+    /// at: 재생 시간을 읽은 순간(앱 쪽에 늦게 도착해도 시계가 밀리지 않게 이걸 기준으로 맞춘다)
+    static func read() -> Result<(json: String, tab: NSAppleEventDescriptor, at: Date)?, NSError> {
         guard !NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.Chrome").isEmpty else { return .success(nil) }
-        var found: (json: String, tab: NSAppleEventDescriptor)?, failed: NSError?
+        var found: (json: String, tab: NSAppleEventDescriptor, at: Date)?, failed: NSError?
         do {
             for (tab, url) in try tabs() where url.contains("youtube.com/watch") {
                 do {
+                    let start = Date()
                     let r = try run(js, in: tab)
+                    let at = start.addingTimeInterval(Date().timeIntervalSince(start) / 2)  // 요청과 응답의 중간쯤에 읽혔다
                     if r.isEmpty { continue }
-                    if r.contains("\"playing\":true") { return .success((r, tab)) }
-                    if found == nil { found = (r, tab) }
+                    if r.contains("\"playing\":true") { return .success((r, tab, at)) }
+                    if found == nil { found = (r, tab, at) }
                 } catch { failed = error as NSError }
             }
         } catch { return .failure(error as NSError) }
@@ -462,7 +466,8 @@ enum Store {
     }
 }
 
-struct Video: Decodable { var id, title: String; var time, duration: Double; var playing, ad: Bool }
+/// at: 페이지가 재생 시간을 읽은 순간(1970년부터 ms). 브라우저와 같은 시스템 시계라 응답이 늦게 와도 정확하다.
+struct Video: Decodable { var id, title: String; var time: Double; var at: Double? = nil; var duration: Double; var playing, ad: Bool }
 
 final class Model: ObservableObject {
     @Published var video: Video?
@@ -471,7 +476,7 @@ final class Model: ObservableObject {
     @Published var lyrics: [String: Lyrics] = Store.load("lyrics.json") ?? [:]  // 곡 이름 → 가사
     var info: [String: Info] = Store.load("info.json") ?? [:]  // 영상 id → 설명란·댓글, 채널, 분류(저장해 둔 걸 먼저 쓰고 새로 받아 바꾼다)
     var dirty = false  // 디스크에 아직 안 쓴 게 있음
-    var last: (json: String, tab: NSAppleEventDescriptor)?  // 마지막으로 읽은 영상(설명란이 오자마자 다시 반영하려고)
+    var last: (json: String, tab: NSAppleEventDescriptor, at: Date)?  // 마지막으로 읽은 영상(설명란이 오자마자 다시 반영하려고)
     var lastFetch = Date.distantPast  // 미리 찾기 간격
     var asked = Set<String>()
     var tries: [String: Int] = [:]  // 곡 이름 → 가사 찾기 실패 횟수
@@ -512,7 +517,7 @@ final class Model: ObservableObject {
             DispatchQueue.main.async {
                 self.busy.poll = false
                 switch r {
-                case .success(let found?): self.problem = nil; self.last = found; self.apply(found.json, tab: found.tab)
+                case .success(let found?): self.problem = nil; self.last = found; self.apply(found.json, tab: found.tab, at: found.at)
                 case .success(nil): self.problem = nil; self.video = nil
                 case .failure(let e) where e.code == -1743:
                     self.problem = "시스템 설정 > 개인정보 보호 및 보안 > 자동화에서\nChrome 제어를 허용해 주세요"; self.video = nil
@@ -525,7 +530,7 @@ final class Model: ObservableObject {
     }
 
     /// Chrome에서 읽은 영상 JSON과 그 탭을 반영한다
-    func apply(_ json: String, tab: NSAppleEventDescriptor) {
+    func apply(_ json: String, tab: NSAppleEventDescriptor, at: Date = Date()) {
         guard var v = try? JSONDecoder().decode(Video.self, from: Data(json.utf8)) else { video = nil; return }
         // 광고 동안은 곡 시간을 멈춰 둔다. 켜자마자 광고면 광고 시간을 곡 시간으로 착각하지 않게 아직 띄우지 않는다.
         if v.ad {
@@ -539,7 +544,7 @@ final class Model: ObservableObject {
                 let i = await fetchInfo(id)
                 await MainActor.run {
                     if let i { self.info[id] = i; self.dirty = true } else { DispatchQueue.main.asyncAfter(deadline: .now() + 30) { self.asked.remove(id) } }
-                    if let l = self.last { self.apply(l.json, tab: l.tab) }  // 다음 읽기를 기다리지 않고 바로
+                    if let l = self.last { self.apply(l.json, tab: l.tab, at: l.at) }  // 다음 읽기를 기다리지 않고 바로
                 }
                 if let d = await art, let img = NSImage(data: d) {
                     await MainActor.run { self.thumbs[id] = img; self.artwork[id] = MPMediaItemArtwork(boundsSize: img.size) { _ in img } }
@@ -556,7 +561,8 @@ final class Model: ObservableObject {
         else { video = nil; self.tab = nil; return }
         self.tab = tab
         video = v
-        polledAt = Date()
+        // 결과가 도착한 때가 아니라 페이지가 읽은 순간 기준(그 사이 Chrome이나 앱이 바빴으면 그만큼 어긋나던 것)
+        polledAt = v.at.map { Date(timeIntervalSince1970: $0 / 1000) } ?? at
         tracks = found
         single = one
 
@@ -642,7 +648,7 @@ final class Model: ObservableObject {
     var line: String? {
         let s = song
         guard let l = lyrics[s.name], !l.note else { return nil }
-        let i = lineIndex(l, at: t - s.start, length: s.length)
+        let i = lineIndex(l, at: t - s.start - lyricDelay, length: s.length)
         return l.lines.indices.contains(i) && !l.lines[i].isEmpty ? l.lines[i] : "♪"
     }
 
@@ -715,6 +721,13 @@ struct NotchView: View {
             let size = m.size
             Group { if !m.expanded { closed } else if m.video != nil { open } else { notice } }
                 .frame(width: size.width, height: size.height, alignment: .top)
+                .overlay(alignment: .topLeading) {  // 펼쳤을 때 실제 노치 왼쪽에 설정 버튼
+                    if m.expanded {
+                        Button { Settings.open() } label: { Image(systemName: "gearshape.fill").font(.system(size: 13)).opacity(0.7) }
+                            .buttonStyle(.plain)
+                            .padding(.leading, 16).padding(.top, (notch.height - 14) / 2)
+                    }
+                }
                 .background(.black)
                 .clipShape(UnevenRoundedRectangle(bottomLeadingRadius: m.expanded ? 24 : 10, bottomTrailingRadius: m.expanded ? 24 : 10))
                 .opacity(m.visible ? 1 : 0)
@@ -722,13 +735,6 @@ struct NotchView: View {
                 .animation(.spring(response: 0.35, dampingFraction: 0.8), value: m.expanded)
                 .animation(.spring(response: 0.45, dampingFraction: 0.85), value: m.visible)  // 노치에서 스르륵 나오고 접혀 들어간다
                 .animation(.easeInOut(duration: 0.3), value: m.video == nil)  // 안내 ↔ 곡 바뀔 때 겹쳐서
-                .contextMenu {  // 설치형 앱이라 끌 곳이 있어야 한다(펼쳤을 때만 마우스를 받으니 펼친 채 우클릭)
-                    Toggle("로그인할 때 자동으로 열기", isOn: Binding(
-                        get: { SMAppService.mainApp.status == .enabled },
-                        set: { on in try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }))
-                    Divider()
-                    Button("YouTube Lyric Notch 종료") { NSApp.terminate(nil) }
-                }
         }
         .foregroundStyle(.white)
     }
@@ -886,12 +892,13 @@ func isLocked() -> Bool { (CGSessionCopyCurrentDictionary() as? [String: Any])?[
 struct LyricsView: View {
     @ObservedObject var m: Model
     let now: Double  // 영상 시간. 부모의 0.25초 타이머가 넘겨 줘야 가사가 제때 넘어간다(m만으로는 Chrome을 읽을 때만 다시 그려짐)
+    @AppStorage("lyricDelay") var delay = 0.5  // 가사 타이밍(설정)
     @State private var shown = 0  // 직전에 보여 준 줄
 
     var body: some View {
         let s = m.song, l = m.lyrics[s.name] ?? Lyrics()
         let rows = ["♪"] + l.lines.map { $0.isEmpty ? "♪" : $0 }  // 맨 앞 ♪ = 첫 줄 전 전주
-        let i = lineIndex(l, at: now - s.start, length: s.length) + 1, rowH: CGFloat = 22
+        let i = lineIndex(l, at: now - s.start - delay, length: s.length) + 1, rowH: CGFloat = 22
         VStack(spacing: 0) {
             ForEach(rows.indices, id: \.self) { j in
                 Text(rows[j])
@@ -912,6 +919,108 @@ struct LyricsView: View {
     }
 }
 
+// MARK: 설정 · 떠 있는 가사 창 · 메뉴 막대
+
+/// 가사 보기 방식: "notch" = 노치에 마우스를 올려서 / "float" = 화면에 떠 있는 가사 창
+var floating: Bool { UserDefaults.standard.string(forKey: "mode") == "float" }
+
+/// 가사를 몇 초 늦게 넘길지. 플리 업로더가 적는 시작 시간이 실제 노래보다 조금 이르다
+/// (측정: 다음 곡 소리가 타임라인보다 0.55초 늦게 시작). 그래서 기본은 0.5초 늦게, 설정에서 귀에 맞게 조절.
+var lyricDelay: Double { UserDefaults.standard.object(forKey: "lyricDelay") as? Double ?? 0.5 }
+
+struct SettingsView: View {
+    @AppStorage("mode") var mode = "notch"
+    @AppStorage("floatOpacity") var opacity = 0.3
+    @AppStorage("lyricDelay") var delay = 0.5
+    @AppStorage("showMenuIcon") var menuIcon = true
+    @State private var login = SMAppService.mainApp.status == .enabled
+
+    var body: some View {
+        Form {
+            Picker("가사 보기", selection: $mode) {
+                Text("노치에 마우스를 올려서 보기").tag("notch")
+                Text("화면에 떠 있는 가사 창").tag("float")
+            }
+            .pickerStyle(.radioGroup)
+            if mode == "float" {
+                Slider(value: $opacity, in: 0...0.8) { Text("배경 진하기") }
+                Text("가사 창은 끌어서 원하는 곳으로 옮길 수 있어요. 0이면 배경 없이 글자만 보여요.").font(.caption).foregroundStyle(.secondary)
+            }
+            Slider(value: $delay, in: -1...2, step: 0.1) { Text("가사 타이밍 \(String(format: "%+.1f", delay))초") }
+            Text("가사가 노래보다 먼저 넘어가면 늘리고, 늦게 넘어가면 줄여 주세요.").font(.caption).foregroundStyle(.secondary)
+            Toggle("메뉴 막대에 아이콘 보이기", isOn: $menuIcon)
+            if !menuIcon {
+                Text("아이콘을 숨겨도 응용 프로그램에서 앱을 다시 열면 이 설정 창이 열려요.").font(.caption).foregroundStyle(.secondary)
+            }
+            Toggle("로그인할 때 자동으로 열기", isOn: $login)
+                .onChange(of: login) { _, on in try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }
+            HStack {
+                Spacer()
+                Button("YouTube Lyric Notch 종료") { NSApp.terminate(nil) }
+            }
+        }
+        .formStyle(.grouped)
+        // 그룹 폼은 안에서 스크롤돼 스스로 높이를 정하지 않는다(창이 제목 줄만 남는다). 방식마다 높이를 정해 준다.
+        .frame(width: 400, height: (mode == "float" ? 390 : 310) + (menuIcon ? 45 : 90))
+    }
+}
+
+/// 설정 창(하나만 만들어 두고 다시 띄운다)
+enum Settings {
+    static var window: NSWindow?
+    static func open() {
+        if window == nil {
+            let content = NSHostingController(rootView: SettingsView())
+            content.sizingOptions = .preferredContentSize  // 가사 보기 방식을 바꿔 내용이 늘면 창도 따라 커진다
+            let w = NSWindow(contentViewController: content)
+            w.title = "YouTube Lyric Notch 설정"
+            w.styleMask = [.titled, .closable]
+            w.isReleasedWhenClosed = false
+            w.center()
+            window = w
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+
+/// 화면에 떠 있는 가사 창: 반투명이라 시선을 덜 끌고, 끌어서 옮길 수 있다(위치는 기억)
+struct FloatingLyrics: View {
+    @ObservedObject var m: Model
+    @AppStorage("floatOpacity") var opacity = 0.3
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.25)) { _ in
+            LyricsView(m: m, now: m.t)
+                .shadow(color: .black.opacity(0.7), radius: 2)  // 밝은 화면 위에서도 글자가 읽히게
+                .padding(.vertical, 8).padding(.horizontal, 18)
+                .background(.black.opacity(opacity), in: RoundedRectangle(cornerRadius: 18))
+                .foregroundStyle(.white)
+        }
+    }
+}
+let floatSize = CGSize(width: 460, height: 86)
+
+/// 아무 데나 잡고 끌면 창이 옮겨지게
+final class DragHost<V: View>: NSHostingView<V> {
+    override var mouseDownCanMoveWindow: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// 메뉴 막대 아이콘을 숨겼을 때 설정을 열 길: 응용 프로그램에서 앱을 다시 열면(이미 실행 중이면) 설정 창
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        Settings.open()
+        return false
+    }
+}
+
+/// 메뉴 막대 ♪ 메뉴의 동작
+final class MenuActions: NSObject {
+    @objc func settings() { Settings.open() }
+    @objc func quit() { NSApp.terminate(nil) }
+}
+
 /// 다른 앱을 쓰는 중에도 버튼이 첫 클릭에 눌리게
 final class Host<V: View>: NSHostingView<V> {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -919,6 +1028,8 @@ final class Host<V: View>: NSHostingView<V> {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+let appDelegate = AppDelegate()
+app.delegate = appDelegate
 let model = Model()
 
 let panel = NSPanel(contentRect: NSRect(x: screen.frame.midX - big.width / 2, y: screen.frame.maxY - big.height, width: big.width, height: big.height),
@@ -984,7 +1095,45 @@ Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in model.poll() }
 Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in model.save() }
 Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in model.publish() }
 Timer.scheduledTimer(withTimeInterval: 0.125, repeats: true) { _ in model.listen() }
+// 떠 있는 가사 창: 메뉴 막대 바로 아래 가운데가 처음 자리, 옮기면 그 자리를 기억한다
+let floatPanel = Card(contentRect: NSRect(origin: .zero, size: floatSize), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+floatPanel.backgroundColor = .clear
+floatPanel.isOpaque = false
+floatPanel.hasShadow = false
+floatPanel.level = .floating
+floatPanel.isMovableByWindowBackground = true
+floatPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+let floatHost = DragHost(rootView: FloatingLyrics(m: model))
+floatHost.sizingOptions = []
+floatPanel.contentView = floatHost
+let saved = UserDefaults.standard
+floatPanel.setFrameOrigin(saved.object(forKey: "floatX") != nil
+    ? NSPoint(x: saved.double(forKey: "floatX"), y: saved.double(forKey: "floatY"))
+    : NSPoint(x: screen.frame.midX - floatSize.width / 2, y: screen.visibleFrame.maxY - floatSize.height - 8))
+NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: floatPanel, queue: .main) { _ in
+    saved.set(floatPanel.frame.minX, forKey: "floatX"); saved.set(floatPanel.frame.minY, forKey: "floatY")
+}
+
+// 메뉴 막대 ♪: 곡이 없어 노치가 숨어 있어도 설정을 열고 끌 수 있게
+let menuActions = MenuActions()
+let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+statusItem.button?.image = NSImage(systemSymbolName: "music.note", accessibilityDescription: "YouTube Lyric Notch")
+statusItem.menu = {
+    let menu = NSMenu()
+    for (title, action, key) in [("설정…", #selector(MenuActions.settings), ","), ("YouTube Lyric Notch 종료", #selector(MenuActions.quit), "q")] {
+        if title.hasSuffix("종료") { menu.addItem(.separator()) }
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = menuActions
+        menu.addItem(item)
+    }
+    return menu
+}()
+
 Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+    let icon = UserDefaults.standard.object(forKey: "showMenuIcon") as? Bool ?? true  // 설정에서 숨길 수 있다
+    if statusItem.isVisible != icon { statusItem.isVisible = icon }
+    let show = floating && model.video != nil  // 떠 있는 가사 창은 그 방식을 골랐고 곡이 있을 때만
+    if show != floatPanel.isVisible { show ? floatPanel.orderFrontRegardless() : floatPanel.orderOut(nil) }
     let s = model.size
     let r = NSRect(x: screen.frame.midX - s.width / 2, y: screen.frame.maxY - s.height, width: s.width, height: s.height + 1)
     let hover = model.visible && r.contains(NSEvent.mouseLocation)
