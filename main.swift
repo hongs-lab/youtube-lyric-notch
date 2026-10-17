@@ -982,23 +982,30 @@ struct LyricsView: View {
         let s = m.song, l = m.lyrics[m.key(s.name)] ?? Lyrics()
         let rows = ["♪"] + l.lines.map { $0.isEmpty ? "♪" : $0 }  // 맨 앞 ♪ = 첫 줄 전 전주
         let i = lineIndex(l, at: now - s.start - delay, length: s.length) + 1, rowH: CGFloat = 22
-        VStack(spacing: 0) {
-            ForEach(rows.indices, id: \.self) { j in
-                Text(rows[j])
-                    .font(.system(size: 15, weight: .semibold))
-                    .lineLimit(1)
-                    .scaleEffect(j == i ? 1 : 0.82)
-                    .opacity(j == i ? 1 : abs(j - i) == 1 ? 0.4 : 0)
-                    .frame(maxWidth: .infinity, minHeight: rowH, maxHeight: rowH)
+        ZStack {
+            VStack(spacing: 0) {
+                ForEach(rows.indices, id: \.self) { j in
+                    Text(rows[j])
+                        .font(.system(size: 15, weight: .semibold))
+                        .lineLimit(1)
+                        .scaleEffect(j == i ? 1 : 0.82)
+                        .opacity(j == i ? 1 : abs(j - i) == 1 ? 0.4 : 0)
+                        .frame(maxWidth: .infinity, minHeight: rowH, maxHeight: rowH)
+                }
             }
+            .offset(y: CGFloat(1 - i) * rowH)  // i번째 줄이 가운데 칸에
+            .frame(height: rowH * 3, alignment: .top)
+            .animation(i == shown + 1 ? .spring(response: 0.5, dampingFraction: 0.9) : nil, value: i)
+            .onAppear { shown = i }
+            .onChange(of: i) { _, new in shown = new }
+            .id("\(m.key(s.name))#\(rows.count)")  // 곡이 바뀌거나 가사가 막 도착하면 그 자리에서 시작
+            // 다음 곡으로 넘어가면 맨 위로 되감듯: 이전 곡 가사는 아래로 빠지고 새 곡의 첫 줄이 위에서 내려온다
+            .transition(.asymmetric(insertion: .move(edge: .top).combined(with: .opacity),
+                                    removal: .move(edge: .bottom).combined(with: .opacity)))
         }
-        .offset(y: CGFloat(1 - i) * rowH)  // i번째 줄이 가운데 칸에
-        .frame(height: rowH * 3, alignment: .top)
+        .frame(height: rowH * 3)
         .clipped()
-        .animation(i == shown + 1 ? .spring(response: 0.5, dampingFraction: 0.9) : nil, value: i)
-        .onAppear { shown = i }
-        .onChange(of: i) { _, new in shown = new }
-        .id("\(s.name)#\(rows.count)")  // 곡이 바뀌거나 가사가 막 도착하면 그 자리에서 시작
+        .animation(.spring(response: 0.6, dampingFraction: 0.9), value: m.key(s.name))  // 가사만 막 도착했을 땐 움직이지 않는다
     }
 }
 
