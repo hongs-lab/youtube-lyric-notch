@@ -51,7 +51,12 @@ public class Model
     public List<Track> Tracks = new();
     public (string Name, string? Author)? Single;
     public GlobalSystemMediaTransportControlsSession? Session;
-    public Dictionary<string, Lyrics> LyricsByName = Store.Load<Dictionary<string, Lyrics>>("lyrics.json") ?? new();
+    // "영상 id|곡 이름" → 가사. 곡 이름만으로는 다른 플리의 같은 제목 곡과 섞여서 영상별로 둔다
+    // (파일 이름을 바꿔, 예전에 같은 제목의 다른 가수 곡으로 잘못 저장된 가사는 버린다)
+    public Dictionary<string, Lyrics> LyricsByName = Store.Load<Dictionary<string, Lyrics>>("lyrics-v2.json") ?? new();
+    string? hint;        // 플리의 주인공 가수(곡 제목만 적은 플리에서 검색어·가수 확인에)
+    string context = ""; // 영상 제목·채널(검색 결과의 가수 확인에)
+    public string Key(string name) => $"{Id}|{name}";
     public Dictionary<string, Info> InfoById = Store.Load<Dictionary<string, Info>>("info.json") ?? new();
     public Dictionary<string, string> IdByTitle = Store.Load<Dictionary<string, string>>("ids.json") ?? new();
     readonly HashSet<string> asked = new(), loading = new();
@@ -141,15 +146,17 @@ public class Model
         Id = id;
         Tracks = songs.List ?? new();
         Single = songs.One != null ? (songs.One, songs.Author) : null;
+        hint = Core.PlaylistArtist(Title, Tracks);
+        context = Title + " " + meta.Author;
         var s = Song;
-        if (songs.None) { if (!LyricsByName.ContainsKey(s.Name)) LyricsByName[s.Name] = Lyrics.MakeNote("타임라인을 못 찾았어요"); return; }
+        if (songs.None) { if (!LyricsByName.ContainsKey(Key(s.Name))) LyricsByName[Key(s.Name)] = Lyrics.MakeNote("타임라인을 못 찾았어요"); return; }
         Want(s.Name, Single?.Author, s.Length);
         // 플리의 나머지 곡 가사도 지금 곡 다음부터 차례로 미리 찾아 둔다(요청 제한을 피하려고 한 번에 한 곡, 1초씩 쉬어 가며)
         if (loading.Count > 0 || (DateTime.Now - lastFetch).TotalSeconds < 1 || Tracks.Count == 0) return;
         var i = Math.Max(0, Tracks.FindLastIndex(x => x.Start <= T));
         foreach (var k in Enumerable.Range(i + 1, Tracks.Count - i - 1).Concat(Enumerable.Range(0, i)))
         {
-            if (LyricsByName.ContainsKey(Tracks[k].Name)) continue;
+            if (LyricsByName.ContainsKey(Key(Tracks[k].Name))) continue;
             var end = k + 1 < Tracks.Count ? Tracks[k + 1].Start : Duration;
             Want(Tracks[k].Name, null, end - Tracks[k].Start);
             break;
@@ -160,22 +167,26 @@ public class Model
 
     void Want(string name, string? author, double length)
     {
-        if (LyricsByName.ContainsKey(name)) return;
+        var k = Key(name);
+        if (LyricsByName.ContainsKey(k)) return;
         // "광고 스킵", "intro" 같은 타임라인 메모는 곡이 아니다
-        if (System.Text.RegularExpressions.Regex.IsMatch(name, @"(?i)^\s*(광고|ad\b|intro|인트로|outro|아웃트로)")) { LyricsByName[name] = Lyrics.MakeNote("♪"); return; }
-        LyricsByName[name] = Lyrics.MakeNote("가사 찾는 중…");
-        loading.Add(name);
-        _ = Task.Run(() => Core.FetchLyrics(name, author, length)).ContinueWith(task =>
+        if (System.Text.RegularExpressions.Regex.IsMatch(name, @"(?i)^\s*(광고|ad\b|intro|인트로|outro|아웃트로)")) { LyricsByName[k] = Lyrics.MakeNote("♪"); return; }
+        LyricsByName[k] = Lyrics.MakeNote("가사 찾는 중…");
+        loading.Add(k);
+        // 곡 이름에 이미 그 가수가 있으면 hint는 안 붙인다
+        var h = hint != null && !Core.Squash(name).Contains(Core.Squash(hint)) ? hint : null;
+        var ctx = context;
+        _ = Task.Run(() => Core.FetchLyrics(name, author, length, h, ctx)).ContinueWith(task =>
         {
             var l = task.Result;
-            loading.Remove(name);
+            loading.Remove(k);
             lastFetch = DateTime.Now;
             // 서버에 못 닿았으면 30초 뒤 다시, 세 번까지
-            var n = l == null ? tries.GetValueOrDefault(name) + 1 : 0;
-            tries[name] = n;
-            LyricsByName[name] = l ?? Lyrics.MakeNote(n < 3 ? "가사 서버에 연결 못 함, 30초 뒤 다시" : "가사를 못 찾았어요");
+            var n = l == null ? tries.GetValueOrDefault(k) + 1 : 0;
+            tries[k] = n;
+            LyricsByName[k] = l ?? Lyrics.MakeNote(n < 3 ? "가사 서버에 연결 못 함, 30초 뒤 다시" : "가사를 못 찾았어요");
             if (l is { Note: false }) dirty = true;
-            if (l == null && n < 3) _ = Task.Delay(30_000).ContinueWith(_ => LyricsByName.Remove(name), TaskScheduler.FromCurrentSynchronizationContext());
+            if (l == null && n < 3) _ = Task.Delay(30_000).ContinueWith(_ => LyricsByName.Remove(k), TaskScheduler.FromCurrentSynchronizationContext());
         }, TaskScheduler.FromCurrentSynchronizationContext());
     }
 
@@ -183,7 +194,7 @@ public class Model
     {
         if (!dirty) return;
         dirty = false;
-        Store.Save(LyricsByName.Where(kv => !kv.Value.Note).ToDictionary(kv => kv.Key, kv => kv.Value), "lyrics.json");
+        Store.Save(LyricsByName.Where(kv => !kv.Value.Note).ToDictionary(kv => kv.Key, kv => kv.Value), "lyrics-v2.json");
         Store.Save(InfoById, "info.json");
         Store.Save(IdByTitle, "ids.json");
     }
@@ -434,7 +445,7 @@ public class Island
         now.Text = Win.Clock(into); len.Text = Win.Clock(s.Length);
         fill.Width = Math.Max(0, track.ActualWidth * Math.Clamp(into / Math.Max(s.Length, 1), 0, 1));
         play.Text = m.Playing ? "" : "";
-        if (expanded) lyrics.Update(m.LyricsByName.GetValueOrDefault(s.Name), s.Name, into - Prefs.Now.Delay, s.Length);
+        if (expanded) lyrics.Update(m.LyricsByName.GetValueOrDefault(m.Key(s.Name)), s.Name, into - Prefs.Now.Delay, s.Length);
         // 막대: 브라우저 소리 크기를 따라, 칸마다 조금씩 다르게
         var sec = DateTime.Now.TimeOfDay.TotalSeconds;
         for (var k = 0; k < bars.Length; k++)
@@ -473,7 +484,7 @@ public class Floating
         if (!show) return;
         bg.Background = new SolidColorBrush(Color.FromArgb((byte)(Prefs.Now.Opacity * 255), 0, 0, 0));
         var s = m.Song;
-        lyrics.Update(m.LyricsByName.GetValueOrDefault(s.Name), s.Name, t - s.Start - Prefs.Now.Delay, s.Length);
+        lyrics.Update(m.LyricsByName.GetValueOrDefault(m.Key(s.Name)), s.Name, t - s.Start - Prefs.Now.Delay, s.Length);
     }
 }
 
