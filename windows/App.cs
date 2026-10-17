@@ -247,30 +247,41 @@ public class Meter
     }
 }
 
-/// 가사 세 줄 창: 한 줄씩 넘어갈 때만 위로 미끄러지고, 탐색·건너뛰기로 크게 뛰면 그 자리로 바로 간다
+/// 가사 세 줄 창: 한 줄씩 넘어갈 때만 위로 미끄러지고, 탐색·건너뛰기로 크게 뛰면 그 자리로 바로 간다.
+/// 다음 곡으로 넘어가면 맨 위로 되감듯 이전 곡 가사는 아래로 빠지고 새 곡의 첫 줄이 위에서 내려온다.
 public class LyricsPanel : Canvas
 {
     const double RowH = 24;
-    readonly StackPanel stack = new();
-    readonly TranslateTransform shift = new();
-    string key = "";
+    StackPanel stack = new();
+    TranslateTransform shift = new();
+    string key = "", song = "";
     int shown = -1;
 
-    public LyricsPanel(double width)
-    {
-        Width = width; Height = RowH * 3; ClipToBounds = true;
-        stack.Width = width; stack.RenderTransform = shift;
-        Children.Add(stack);
-    }
+    public LyricsPanel(double width) { Width = width; Height = RowH * 3; ClipToBounds = true; }
+
+    static DoubleAnimation Ease(double to) => new(to, TimeSpan.FromSeconds(0.45)) { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } };
 
     public void Update(Lyrics? l, string song, double t, double length)
     {
         l ??= new Lyrics();
         var k = $"{song}#{l.Lines.Count}#{l.Note}";
+        var next = false;
         if (k != key)  // 곡이 바뀌거나 가사가 막 도착: 줄을 새로 깔고 그 자리에서 시작
         {
             key = k; shown = -1;
-            stack.Children.Clear();
+            next = this.song.Length > 0 && song != this.song;  // 가사만 막 도착했을 땐 움직이지 않는다
+            this.song = song;
+            var old = stack;
+            if (next)
+            {
+                ((TranslateTransform)old.RenderTransform).BeginAnimation(TranslateTransform.YProperty, Ease(((TranslateTransform)old.RenderTransform).Y + Height));
+                var fade = Ease(0);
+                fade.Completed += (_, _) => Children.Remove(old);
+                old.BeginAnimation(OpacityProperty, fade);
+            }
+            else Children.Remove(old);
+            stack = new StackPanel { Width = Width, RenderTransform = shift = new TranslateTransform() };
+            Children.Add(stack);
             foreach (var line in new[] { "♪" }.Concat(l.Lines.Select(x => x.Length == 0 ? "♪" : x)))
                 stack.Children.Add(new TextBlock
                 {
@@ -281,8 +292,14 @@ public class LyricsPanel : Canvas
         var i = Core.LineIndex(l, t, length) + 1;
         if (i == shown) return;
         var y = (1 - i) * RowH;  // i번째 줄이 가운데 칸에
-        if (shown >= 0 && i == shown + 1)
-            shift.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(y, TimeSpan.FromSeconds(0.45)) { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } });
+        if (next)
+        {
+            shift.Y = y - Height;
+            shift.BeginAnimation(TranslateTransform.YProperty, Ease(y));
+            stack.Opacity = 0;
+            stack.BeginAnimation(OpacityProperty, Ease(1));
+        }
+        else if (shown >= 0 && i == shown + 1) shift.BeginAnimation(TranslateTransform.YProperty, Ease(y));
         else { shift.BeginAnimation(TranslateTransform.YProperty, null); shift.Y = y; }
         for (var j = 0; j < stack.Children.Count; j++)
         {
