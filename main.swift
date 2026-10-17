@@ -177,7 +177,7 @@ func fetch(_ url: String, _ query: [String: String] = [:], body: Data? = nil) as
     let host = c.host ?? "", lrclib = host == "lrclib.net"
     var req = URLRequest(url: c.url!)
     // LRCLIB는 앱 이름을 밝혀 달라고 한다. 유튜브·벅스는 브라우저처럼.
-    req.setValue(lrclib ? "YouTubeLyricNotch/1.1.1 (personal macOS app)" : "Mozilla/5.0 (youtube-notch, personal)", forHTTPHeaderField: "User-Agent")
+    req.setValue(lrclib ? "YouTubeLyricNotch/1.2.0 (personal macOS app)" : "Mozilla/5.0 (youtube-notch, personal)", forHTTPHeaderField: "User-Agent")
     req.timeoutInterval = 8  // 서버가 늘어지면 기본 60초를 기다리게 된다
     if let body { req.httpMethod = "POST"; req.httpBody = body; req.setValue("application/json", forHTTPHeaderField: "Content-Type") }
     for attempt in 0..<3 {
