@@ -130,6 +130,9 @@ func queries(_ name: String, author: String? = nil, hint: String? = nil) -> [Str
     if let r = name.range(of: #"\s+[-–—]\s+|_"#, options: .regularExpression) {
         let artist = String(name[..<r.lowerBound]), title = tidy(strip(String(name[r.upperBound...])))
         qs.append(tidy(strip(artist).components(separatedBy: CharacterSet(charactersIn: ",&")).first ?? artist) + " " + title)
+        // "곡 - 가수" 순서일 수도 있어서 반대로도("하지마 - 릴러말즈, TOIL" → "릴러말즈 하지마")
+        let right = strip(String(name[r.upperBound...]))
+        qs.append(tidy(right.components(separatedBy: CharacterSet(charactersIn: ",&")).first ?? right) + " " + tidy(strip(artist)))
         qs += artist.matches(of: #/\(([^)]*)\)/#).map { tidy(String($0.1)) + " " + title }
     }
     qs.append(tidy(name))
@@ -223,17 +226,32 @@ func playlistArtist(title: String, tracks: [Track]) -> String? {
 
 let bugsRow = try! NSRegularExpression(pattern: #"<tr[^>]*trackId="\d+".*?</tr>"#, options: .dotMatchesLineSeparators)
 
-/// 벅스 곡 검색 결과에서 제목과 가수가 둘 다 맞는 첫 곡의 id(반주 버전은 가사가 없으니 건너뜀).
-/// 벅스는 곡 길이를 주지 않아 가수로만 확인한다(같은 제목의 다른 가수 곡이 위에 오는 일이 많다).
-func bugsTrack(_ html: String, for name: String, context: String) -> String? {
+let bugsArtist = try! NSRegularExpression(pattern: #"<p class="artist">.*?<a [^>]*title="([^"]*)""#, options: .dotMatchesLineSeparators)
+
+/// 벅스 곡 검색 결과에서 제목이 맞는 곡들(반주 버전은 가사가 없으니 빼고): id와 가수.
+/// 가수 칸 앞에 HTML 주석이 끼는 줄(여러 가수)이 있어 주석을 건너뛰고 첫 가수를 읽는다.
+func bugsCandidates(_ html: String, for name: String) -> [(id: String, artist: String)] {
     let ns = html as NSString
-    for m in bugsRow.matches(in: html, range: NSRange(location: 0, length: ns.length)) {
-        let row = ns.substring(with: m.range)
+    return bugsRow.matches(in: html, range: NSRange(location: 0, length: ns.length)).compactMap { m in
+        let row = ns.substring(with: m.range), rs = row as NSString
         guard let t = row.firstMatch(of: #/value="(\d+)" name="check" disc_id="\d+" title="([^"]*)"/#),
-              let a = row.firstMatch(of: #/<p class="artist">[^<]*<a[^>]*title="([^"]*)"/#) else { continue }
-        if !t.2.contains("Inst."), sameSong(name, String(t.2)), artistIn(String(a.1), context) { return String(t.1) }
+              let a = bugsArtist.firstMatch(in: row, range: NSRange(location: 0, length: rs.length)),
+              !t.2.contains("Inst."), sameSong(name, String(t.2)) else { return nil }
+        return (String(t.1), rs.substring(with: a.range(at: 1)))
     }
-    return nil
+}
+
+/// 제목과 가수가 둘 다 맞는 첫 곡(같은 제목의 다른 가수 곡이 위에 오는 일이 많다)
+func bugsTrack(_ html: String, for name: String, context: String) -> String? {
+    bugsCandidates(html, for: name).first { artistIn($0.artist, context) }?.id
+}
+
+/// 벅스 곡 페이지의 재생 시간(초). 검색 결과에는 곡 길이가 없다.
+func bugsLength(_ id: String) async -> Double? {
+    guard let d = await fetch("https://music.bugs.co.kr/track/\(id)") else { return nil }
+    let text = String(decoding: d, as: UTF8.self).replacingOccurrences(of: #"<[^>]+>"#, with: " ", options: .regularExpression)
+    guard let m = text.firstMatch(of: #/재생 ?시간[^0-9]{0,200}(\d{1,2}):(\d{2})/#) else { return nil }
+    return Double(m.1)! * 60 + Double(m.2)!
 }
 
 func plainLines(_ s: String) -> Lyrics { Lyrics(lines: s.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) }
@@ -247,7 +265,7 @@ typealias Found = (synced: Lyrics?, plain: Lyrics?, failed: Bool)
 func fetchLyrics(_ name: String, author: String?, hint: String? = nil, context: String = "", length: Double) async -> Lyrics? {
     let qs = queries(name, author: author, hint: hint)
     let ctx = [name, hint ?? "", context].joined(separator: " ")
-    async let bugs = bugsLyrics(name, ctx, Array(qs.prefix(3)))
+    async let bugs = bugsLyrics(name, ctx, Array(qs.prefix(3)), length)
     let lrc = await lrclibLyrics(name, ctx, qs, length)
     if let s = lrc.synced { return s }  // 벅스 쪽은 취소된다
     let b = await bugs
@@ -272,11 +290,16 @@ func lrclibLyrics(_ name: String, _ ctx: String, _ qs: [String], _ length: Doubl
     return (nil, plain, failed)
 }
 
-func bugsLyrics(_ name: String, _ ctx: String, _ qs: [String]) async -> Found {
+func bugsLyrics(_ name: String, _ ctx: String, _ qs: [String], _ length: Double) async -> Found {
     var id: String?, failed = false
-    for q in qs where id == nil {  // 제목이 맞는 곡이 나올 때까지 검색어를 바꿔 가며
+    search: for q in qs {  // 맞는 곡이 나올 때까지 검색어를 바꿔 가며
         guard let d = await fetch("https://music.bugs.co.kr/search/track", ["q": q]) else { failed = true; continue }
-        id = bugsTrack(String(decoding: d, as: UTF8.self), for: name, context: ctx)
+        let found = bugsCandidates(String(decoding: d, as: UTF8.self), for: name)
+        if let c = found.first(where: { artistIn($0.artist, ctx) }) { id = c.id; break }
+        // 가수 표기가 달라(빅나티 ↔ BIG Naughty (서동현)) 안 맞으면 곡 길이로: 재생 시간이 타임라인 구간과 비슷한지(후보 3개까지)
+        for c in found.prefix(3) where length > 0 {
+            if let l = await bugsLength(c.id), abs(l - length) <= max(6, length * 0.05) { id = c.id; break search }
+        }
     }
     guard let id else { return (nil, nil, failed) }
     func text(_ d: Data?) -> String? { d.flatMap { try? JSONDecoder().decode(BugsLyrics.self, from: $0) }?.lyrics.flatMap { $0.isEmpty ? nil : $0 } }
@@ -309,8 +332,9 @@ if CommandLine.arguments.contains("--selftest") {
     let o = parseLRC("[ar:IU]\n[offset:+500]\n[00:02.00]a\n[00:02.00]b\n[00:03.00]<00:03.10>c <00:03.50>d")
     precondition(o.lines == ["a / b", "c d"] && o.times == [1.5, 2.5], "\(o)")
     let q = queries("아이유 (IU) - 밤편지 (Through the Night) [MV]")
-    precondition(q == ["아이유 밤편지", "IU 밤편지", "아이유 IU 밤편지 Through the Night"], "\(q)")
-    precondition(queries("CHUNG HA (청하) - México") == ["CHUNG HA Mexico", "청하 Mexico", "CHUNG HA 청하 Mexico"], "\(queries("CHUNG HA (청하) - México"))")
+    precondition(q == ["아이유 밤편지", "밤편지 아이유", "IU 밤편지", "아이유 IU 밤편지 Through the Night"], "\(q)")
+    precondition(queries("CHUNG HA (청하) - México") == ["CHUNG HA Mexico", "Mexico CHUNG HA", "청하 Mexico", "CHUNG HA 청하 Mexico"], "\(queries("CHUNG HA (청하) - México"))")
+    precondition(Array(queries("하지마 - 릴러말즈, TOIL").prefix(2)) == ["하지마 릴러말즈 TOIL", "릴러말즈 하지마"])
     precondition(queries("파테코, 제이씨유카, Kid Wine - 널 떠올리는 중이야")[1] == "파테코 널 떠올리는 중이야")
     precondition(sameSong("CHUNG HA (청하) - México", "Mexico") && squash("밤편지") == "밤편지")
     precondition(queries("현서 (HYUN SEO)_널 떠나보내기엔 너무 아프지만 (Feat. 이을 (E.ul))")[0] == "현서 널 떠나보내기엔 너무 아프지만")
@@ -328,6 +352,9 @@ if CommandLine.arguments.contains("--selftest") {
     let same = row(1, "거리에서", "성시경") + row(2, "거리에서", "김광석") + row(3, "거리에서 (Feat. ASH ISLAND)", "릴러말즈 (Leellamarz)")
     precondition(bugsTrack(same, for: "거리에서 (Feat. ASH ISLAND)", context: "거리에서 (Feat. ASH ISLAND) 릴러말즈 [Playlist] 릴러말즈 노래모음 |Leellamarz|") == "3")
     precondition(bugsTrack(row(1, "거리에서", "성시경"), for: "거리에서", context: "거리에서 [Playlist] 감성힙합 모음") == nil)
+    // 여러 가수인 줄은 가수 칸 앞에 HTML 주석이 낀다
+    let multi = #"<tr trackId="7"><input type="checkbox" value="7" name="check" disc_id="1" title="하지마"><p class="artist"> <!-- a tag title --> <a href="x" class="artistTitle" title="릴러말즈 (Leellamarz)">릴러말즈</a> <a href="javascript:void(0);" class="more" title="아티스트 전체보기">x</a></p></tr>"#
+    precondition(bugsTrack(multi, for: "하지마 - 릴러말즈, TOIL", context: "하지마 - 릴러말즈, TOIL") == "7")
     precondition(artistIn("Leellamarz, ASH ISLAND", "릴러말즈 (Leellamarz)_거리에서") && artistIn("IU (아이유)", "아이유 - 밤편지") && !artistIn("성시경", "릴러말즈 노래모음"))
     let lr = timeline("0:00 거리에서 (Feat. ASH ISLAND)\n3:29 Trip (Feat. Hannah)\n7:23 하지마 - 릴러말즈, TOIL\n9:00 RUN - 릴러말즈, Panda Gomm")
     precondition(playlistArtist(title: "[Playlist] 설렘 가득 감성힙합 릴러말즈 노래모음 |Leellamarz|", tracks: lr) == "릴러말즈")
